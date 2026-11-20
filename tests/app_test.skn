@@ -60,6 +60,15 @@
         (is (= [:album ["Marigold Strings" "Dawn Suite"]] (view)))
         (click! wid :back)
         (is (= [:albums] (view)) "Back"))
+      (testing "a window sized in fractions of a pixel, as at 125% display scaling on Windows"
+        (click! wid :nav-albums)
+        (swap! app/ui-state assoc :size [1216.0 972.79998])
+        (settle)
+        (click! wid :nav-songs)
+        (is (= [:songs] (view)))
+        (is (there? wid :songs-table-row-0) "the song table still draws")
+        (swap! app/ui-state assoc :size [1240 800])
+        (settle))
       (testing "playing"
         (click! wid :nav-songs)
         (double-click! wid :songs-table-row-0)

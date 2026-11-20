@@ -1,5 +1,5 @@
 {:name linnet
- :version "0.1.0"
+ :version "0.1.1"
  :paths ["src"]
  ;; Each is pinned to a commit on its main branch. `skein deps` fetches them
  ;; and writes skein.lock; after changing a pin, run `skein deps --update`.

@@ -104,8 +104,10 @@
   [{:keys [id rows columns sort on-sort selected on-select on-play menu on-command current
            scroll-y on-scroll viewport] :or {scroll-y 0 viewport 900}}]
   (let [n (count rows)
+        ;; (whole rows: window sizes and scroll positions can be fractions of
+        ;; a pixel, as at 125% display scaling on Windows)
         top (max 0 (dec (quot (int scroll-y) row-height)))
-        end (min n (+ top (quot viewport row-height) 4))
+        end (min n (+ top (quot (int viewport) row-height) 4))
         select! (fn [i] (when (and on-select (< -1 i n)) (on-select i)))]
     [:column {:id id :flex-grow 1 :flex-shrink 1 :min-height 0 :min-width 0 :overflow :hidden :focusable true
               :on-key (fn [e]

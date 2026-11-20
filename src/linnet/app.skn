@@ -11,7 +11,9 @@
             [skein.string :as str]
             [skein.sys :as sys]
             [skein.ui :as ui]
+            [skein.vlc :as vlc]
             [linnet.library :as library]
+            [linnet.log :as log]
             [linnet.player :as player]
             [linnet.scan :as scan]
             [linnet.store :as store]
@@ -84,6 +86,7 @@
 (defn go!
   "Show view, remembering where we were for Back."
   [view]
+  (log/debug! "go" (pr-str view))
   (swap! ui-state (fn [s] (if (= view (:view s))
                             (assoc s :search "")
                             (-> s (update :history (fn [h] (vec (take-last 30 (conj h (:view s))))))
@@ -98,6 +101,7 @@
 (defn- play-tracks!
   "Play tracks, starting with the one at i."
   [tracks i]
+  (log/debug! "play" i "of" (count tracks) (some-> (get tracks i) :path pr-str))
   (when (seq tracks) (player/play-queue! @ctl (mapv :path tracks) i)))
 
 (defn- shuffle-tracks! [tracks]
@@ -150,7 +154,9 @@
   [f]
   (spawn-detached
     (handler-case (f)
-      (Error [c] (notify! (str "Something went wrong: " (condition-message c)))))))
+      (Error [c]
+        (log/log! "background work failed:" (condition-message c))
+        (notify! (str "Something went wrong: " (condition-message c)))))))
 
 (defn add-folder!
   "Ask for a music folder, add it and look through it."
@@ -219,6 +225,7 @@
   (let [t (nth tracks i)
         path (:path t)
         cmd (name command)]
+    (log/debug! "song menu" command (pr-str path))
     (swap! ui-state assoc-in [:selected (table-key @ui-state)] i)
     (cond
       (= command :play) (play-tracks! tracks i)
@@ -638,7 +645,7 @@
         time (or (:time-ms st) 0)
         [ww] (:size s)
         ;; (the two sides take 270 each, the times and gaps about 170)
-        seek-w (max 160 (min 560 (- ww 760)))]
+        seek-w (int (max 160 (min 560 (- ww 760))))]
     [:row {:id :play-bar :height 92 :flex-shrink 0 :background :bar :padding [0 20] :align-items :center :gap 12
            :overflow :hidden}
      ;; what's playing
@@ -872,6 +879,7 @@
      (reset! lib-atom (store/load-library))
      (reset! started true)
      (store/autosave! lib-atom store/save-library!)
+     (log/log! "libVLC" (handler-case (vlc/version) (Error [c] (str "not loaded: " (condition-message c)))))
      (reset! ctl (player/open! (select-keys settings [:volume :shuffle? :repeat])))
      (swap! ui-state merge {:lib @lib-atom :player (player/state @ctl)
                             :view (or (:view settings) [:albums])

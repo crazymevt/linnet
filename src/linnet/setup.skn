@@ -18,6 +18,7 @@
             [skein.ui :as ui]
             [skein.vlc :as vlc]
             [skein.zip :as zip]
+            [linnet.log :as log]
             [linnet.store :as store]
             [linnet.theme :as theme]
             [linnet.widgets :as w]))
@@ -217,7 +218,8 @@
                                         (if (vlc/available?)
                                           (finish!)
                                           (swap! setup-state assoc :stage :ask :error "VLC was downloaded but won't start. Please try again.")))
-                                      (Error [c] (swap! setup-state assoc :stage :ask
+                                      (Error [c] (log/log! "VLC download failed:" (condition-message c))
+                                                 (swap! setup-state assoc :stage :ask
                                                         :error (str "That didn't work: " (condition-message c)))))))}]
      (reset! wid (ui/window {:title "Linnet — setting up" :icon (theme/asset "linnet.ico") :size [640 520] :resizable false}
                             (fn [s] (setup-view s handlers)) setup-state))

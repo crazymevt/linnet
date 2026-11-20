@@ -1,0 +1,26 @@
+(ns log-test
+  (:require [support]
+            [skein.io :as io]
+            [skein.string :as str]
+            [skein.test :refer [deftest is]]
+            [linnet.log :as log]
+            [linnet.store :as store]))
+
+(defn- testing-rotation [dir]
+  ;; (a log over a megabyte moves aside, and a new one starts)
+  (io/write-text (log/log-file) (apply str (repeat (* 1100 1024) "x")))
+  (log/log! "after")
+  (is (io/file? (str (log/log-file) ".old")))
+  (is (str/ends-with? (str/trim (io/read-text (log/log-file))) " after")))
+
+(deftest the-log
+  (let [dir (io/path (io/temp-directory) (str "linnet-log-test-" (nano-time)))]
+    (store/set-data-dir! dir)
+    (log/log! "first" 1 :two)
+    (log/log! "second")
+    (let [lines (vec (remove str/blank? (str/split-lines (io/read-text (log/log-file)))))]
+      (is (= 2 (count lines)))
+      (is (str/ends-with? (first lines) " first 1 :two"))
+      (is (re-find #"^\d{4}-\d\d-\d\d" (first lines)) "each line starts with when"))
+    (testing-rotation dir)))
+

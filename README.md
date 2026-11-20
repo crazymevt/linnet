@@ -68,6 +68,8 @@ Everything Linnet keeps (`library.edn`, `settings.edn`, cover art and a download
 LINNET_DATA_DIR=/tmp/linnet-try ./run.sh
 ```
 
+Linnet keeps a log, `linnet.log`, in the same data folder: when it started and with which VLC, the interface's errors, work that failed in the background, and why a song wouldn't play. On Windows that's the only place they go, since a windowed app has no console. Set `LINNET_DEBUG=1` to log what each click asked for too.
+
 `skein package` builds an app from `skein.edn`, with the renderer, the icon and `assets/` bundled.
 
 ## The icon

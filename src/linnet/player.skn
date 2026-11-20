@@ -11,7 +11,8 @@
 ;;;;   :status   the player's last {:state :time-ms :length-ms}
 
 (ns linnet.player
-  (:require [skein.vlc :as vlc]))
+  (:require [skein.vlc :as vlc]
+            [linnet.log :as log]))
 
 (defclass Controller () ((vlc) (state) (watcher)))
 
@@ -41,7 +42,8 @@
   (let [s @(:state ctl)
         path (current-path s)]
     (when path
-      (let [ok (try (vlc/play! (:vlc ctl) path) true (catch Error _ false))]
+      (let [ok (handler-case (do (vlc/play! (:vlc ctl) path) true)
+                 (Error [c] (log/log! "can't play" (pr-str path) "-" (condition-message c)) false))]
         (if ok
           (swap! (:state ctl) assoc :status {:state :opening :time-ms 0 :length-ms nil} :failures 0)
           (let [n (count (:queue s))]
@@ -250,7 +252,7 @@
        (loop []
          (when @(:watcher ctl)
            (handler-case (poll! ctl)
-             (Error [c] (when @(:watcher ctl) (println "linnet: player watcher:" (condition-message c)))))
+             (Error [c] (when @(:watcher ctl) (log/log! "player watcher:" (condition-message c)))))
            (sleep 100)
            (recur))))
      ctl)))

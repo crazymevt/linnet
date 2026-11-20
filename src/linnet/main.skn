@@ -5,18 +5,27 @@
   (:require [skein.sys :as sys]
             [skein.ui :as ui]
             [linnet.app :as app]
+            [linnet.log :as log]
             [linnet.setup :as setup]
             [linnet.theme :as theme]))
+
+(def version "0.1.1")
 
 (def usage "usage: linnet [--help]
 
 Opens Linnet, the music player. Its library lives in the app's data folder
-(Application Support/Linnet on macOS, %APPDATA%\\Linnet on Windows). Set LINNET_DATA_DIR to keep it somewhere else.")
+(Application Support/Linnet on macOS, %APPDATA%\\Linnet on Windows), with linnet.log, its log. Set LINNET_DATA_DIR to keep them
+somewhere else, and LINNET_DEBUG=1 to log what each click does.")
 
 (defn main [& args]
   (case (vec args)
     ["--help"] (println usage)
-    [] (do (ui/theme! theme/theme)
+    [] (do (log/log! "Linnet" version "starting on" (name (sys/os)) (name (sys/arch))
+                    "with Skein" (:skein-version (sys/info)))
+           ;; (the interface's failures, which a windowed app on Windows
+           ;; would otherwise print to a console it hasn't got)
+           (ui/on-error! (fn [e] (log/log! "interface" (name (:kind e)) (:message e))))
+           (ui/theme! theme/theme)
            (if (setup/ready?)
              (app/start!)
              (setup/show! (fn [] (app/start!))))

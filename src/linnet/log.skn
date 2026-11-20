@@ -1,0 +1,46 @@
+;;;; Linnet's log: linnet.log in its data folder (%APPDATA%\Linnet on
+;;;; Windows). A windowed app on Windows has no console, so what would go
+;;;; to standard error goes here too: start-up, the interface's errors,
+;;;; work that failed in the background, and why a song didn't play. With
+;;;; LINNET_DEBUG=1 it also notes what each click asked for. It keeps
+;;;; about a megabyte, and the one before as linnet.log.old.
+
+(ns linnet.log
+  (:require [skein.io :as io]
+            [skein.string :as str]
+            [skein.sys :as sys]
+            [skein.time :as time]
+            [linnet.store :as store]))
+
+(def ^:private max-size (* 1024 1024))
+(def ^:private permit (chan 1))
+(put! permit true)
+
+(defn log-file [] (io/path (store/data-dir) "linnet.log"))
+
+(defn debug? [] (boolean (not-empty (sys/getenv "LINNET_DEBUG"))))
+
+(defn- stamp [] (str (time/now)))
+
+(defn log!
+  "Add a line to the log (and standard error): the parts, joined with
+  spaces. Never fails: a log that can't be written is skipped."
+  [& parts]
+  (let [line (str (stamp) " " (str/join " " (map str parts)) "\n")]
+    (take! permit)
+    (try
+      (handler-case
+        (let [f (log-file)]
+          (io/mkdirs! (io/parent f))
+          (when (> (or (:size (io/info f)) 0) max-size)
+            (io/rename! f (str f ".old")))
+          (io/append-text f line)
+          (io/eprint line))
+        (Error [_] nil))
+      (finally (put! permit true)))
+    nil))
+
+(defn debug!
+  "log!, when LINNET_DEBUG is set."
+  [& parts]
+  (when (debug?) (apply log! "debug:" parts)))
