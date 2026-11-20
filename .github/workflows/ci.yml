@@ -1,9 +1,12 @@
 name: CI
 
+# (not for changes that are only words and pictures: they can't break a build)
 on:
   push:
     branches: [main]
+    paths-ignore: ["**.md", "docs/**", "LICENSE"]
   pull_request:
+    paths-ignore: ["**.md", "docs/**", "LICENSE"]
   workflow_dispatch:
 
 concurrency:

@@ -93,11 +93,11 @@ GitHub Actions builds and tests Linnet on macOS (arm64), Linux (x86-64 and arm64
 
 - **Skein:** built from skein-lang's `main`. On Windows it uses clang and skein-lang's MMTk patch, as skein-lang's own CI does.
 - **Libraries:** `skein deps` fetches the pinned skein-ui and skein-vlc, and the renderer is built inside the fetched skein-ui.
-- **libVLC:** from apt on Linux and Homebrew on macOS. On Windows it's downloaded with `tools/install-vlc.skn`, the same code as Linnet's setup window, so CI also checks VideoLAN's real zips.
+- **libVLC:** from apt on Linux. On macOS it's VideoLAN's own disk image, pinned by version and SHA-256 in the setup action. On Windows it's downloaded with `tools/install-vlc.skn`, the same code as Linnet's setup window, so CI also checks VideoLAN's real zips. On macOS and Windows the unpacked VLC is cached, so VideoLAN's servers are asked only when a pin changes. (Keep the macOS pin in step with `vlc-releases` in `src/linnet/setup.skn`.)
 
 CI machines have no sound card, so the tests run VLC with `LINNET_VLC_OPTIONS=--aout=adummy`.
 
-- **CI** (`.github/workflows/ci.yml`) runs the tests on every push and pull request, and keeps a screenshot of each view from every platform as a build artifact. Only macOS can fail the run for now. The Linux jobs wait on skein-ui's renderer, which isn't proven on Linux yet, and the Windows jobs wait on Skein's FFI there.
+- **CI** (`.github/workflows/ci.yml`) runs the tests on every push and pull request (except ones that only change Markdown, `docs/` or the licence), and keeps a screenshot of each view from every platform as a build artifact. Only macOS can fail the run for now. The Linux jobs wait on skein-ui's renderer, which isn't proven on Linux yet, and the Windows jobs wait on Skein's FFI there.
 - **Releases** (`.github/workflows/release.yml`): push a tag that matches `skein.edn`'s `:version`, such as `v0.1.0`. Each platform is tested and packaged, then a **draft** release is made with every package that built, to check and publish by hand.
   - **macOS:** `Linnet.app` (zipped) and a command-line archive.
   - **Linux:** a command-line archive.

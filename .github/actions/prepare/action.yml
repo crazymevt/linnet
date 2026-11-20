@@ -44,10 +44,34 @@ runs:
         sudo apt-get update -qq
         sudo apt-get install -y -qq libgtk-3-dev libxdo-dev mesa-vulkan-drivers libvlc5 vlc-plugin-base
 
-    - name: VLC (macOS)
+    # macOS: VideoLAN's own disk image, pinned and checked like the Windows
+    # zips in src/linnet/setup.skn, and cached, so VideoLAN's servers are
+    # only asked when the pin changes. (Keep the version in step with
+    # setup.skn's vlc-releases.)
+    - name: Cached VLC (macOS)
       if: runner.os == 'macOS'
+      id: vlc-mac-cache
+      uses: actions/cache@v4
+      with:
+        path: /Applications/VLC.app
+        key: vlc-macOS-arm64-64a89d93cdd30b0e97131743e246373db82d6826ea882d265d46d74b136da2b7
+
+    - name: VLC from VideoLAN (macOS)
+      if: runner.os == 'macOS' && steps.vlc-mac-cache.outputs.cache-hit != 'true'
       shell: bash
-      run: brew install --cask vlc
+      env:
+        VLC_DMG_URL: https://download.videolan.org/pub/videolan/vlc/3.0.24/macosx/vlc-3.0.24-arm64.dmg
+        VLC_DMG_SHA256: 64a89d93cdd30b0e97131743e246373db82d6826ea882d265d46d74b136da2b7
+      run: |
+        dmg="$RUNNER_TEMP/vlc.dmg"
+        curl -fsSL --retry 3 -o "$dmg" "$VLC_DMG_URL"
+        echo "$VLC_DMG_SHA256  $dmg" | shasum -a 256 -c -
+        mnt="$RUNNER_TEMP/vlc-mount"
+        hdiutil attach -nobrowse -readonly -mountpoint "$mnt" "$dmg"
+        rm -rf /Applications/VLC.app
+        cp -R "$mnt/VLC.app" /Applications/
+        hdiutil detach "$mnt"
+        test -f /Applications/VLC.app/Contents/MacOS/lib/libvlc.dylib
 
     - uses: dtolnay/rust-toolchain@stable
 
