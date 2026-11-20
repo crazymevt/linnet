@@ -101,7 +101,7 @@ CI machines have no sound card, so the tests run VLC with `LINNET_VLC_OPTIONS=--
 - **Releases** (`.github/workflows/release.yml`): push a tag that matches `skein.edn`'s `:version`, such as `v0.1.0`. Each platform is tested and packaged, then a **draft** release is made with every package that built, to check and publish by hand.
   - **macOS:** `Linnet.app` (zipped) and a command-line archive.
   - **Linux:** a command-line archive.
-  - **Windows:** a zip from `skein package --windows` where Skein has it, or the command-line archive until then.
+  - **Windows (x64 and ARM64):** an installer, `Linnet-VERSION-windows-ARCH-setup.exe`, built with [Inno Setup](https://jrsoftware.org/isinfo.php) from `packaging/windows/linnet.iss`, and the same app as a portable zip from `skein package --windows`. The installer needs no administrator. It installs for the person running it, under `%LOCALAPPDATA%\Programs\Linnet`, adds a Start-menu shortcut (and a desktop one, ticked by default) and an uninstaller. Uninstalling leaves the library in `%APPDATA%\Linnet`. The x64 installer also runs on ARM PCs, emulated.
 
   A platform whose job fails is left out of the draft rather than stopping it.
 

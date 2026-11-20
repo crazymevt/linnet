@@ -66,13 +66,9 @@ jobs:
           case "$RUNNER_OS" in
             macOS) "$SKEIN" package --app --cli --out "$out" ;;
             Linux) "$SKEIN" package --cli --out "$out" ;;
-            # A windowed Linnet.exe with its icon, in a zip, once skein
-            # package has --windows; until then the plain archive.
-            Windows)
-              if ! "$SKEIN" package --windows --out "$out"; then
-                echo "::warning::No skein package --windows in this Skein: making the plain archive"
-                "$SKEIN" package --cli --out "$out"
-              fi ;;
+            # A windowed linnet.exe with its icon, in a zip (and an installer
+            # made from it, next)
+            Windows) "$SKEIN" package --windows --out "$out" ;;
           esac
           # Each file named for its platform, so the release's names don't clash.
           mkdir -p "$RUNNER_TEMP/named"
@@ -87,6 +83,31 @@ jobs:
             stem=$(echo "$stem" | sed -E 's/-(macos|linux|windows)-(aarch64|arm64|x86_64|x86-64)$//')
             cp "$f" "$RUNNER_TEMP/named/$stem-${{ matrix.slug }}${ext:+.$ext}"
           done
+          ls -la "$RUNNER_TEMP/named"
+
+      - name: Windows installer
+        if: runner.os == 'Windows'
+        working-directory: linnet
+        run: |
+          version=$(grep -o ':version "[^"]*"' skein.edn | head -1 | cut -d'"' -f2)
+          arch=x64; [ "$RUNNER_ARCH" = ARM64 ] && arch=arm64
+          zip=$(find "$RUNNER_TEMP/dist" -name '*-windows-*.zip' | head -1)
+          [ -n "$zip" ] || { echo "::error::skein package --windows made no zip"; exit 1; }
+          stage="$RUNNER_TEMP/stage"
+          rm -rf "$stage" && mkdir -p "$stage"
+          powershell -NoProfile -Command "Expand-Archive -LiteralPath '$(cygpath -w "$zip")' -DestinationPath '$(cygpath -w "$stage")'"
+          test -f "$stage/Linnet/bin/linnet.exe" || { echo "::error::No Linnet/bin/linnet.exe in $zip"; find "$stage" -maxdepth 3 | head -30; exit 1; }
+          # Inno Setup: on the runner image, else from Chocolatey
+          iscc="/c/Program Files (x86)/Inno Setup 6/ISCC.exe"
+          if [ ! -f "$iscc" ]; then
+            choco install innosetup -y --no-progress
+          fi
+          [ -f "$iscc" ] || { echo "::error::No Inno Setup"; exit 1; }
+          # (-D, not /D: Git Bash would take /D… for a path and rewrite it)
+          "$iscc" -Q \
+            "-DAppVersion=$version" "-DArch=$arch" \
+            "-DSourceDir=$(cygpath -w "$stage/Linnet")" "-DOutputDir=$(cygpath -w "$RUNNER_TEMP/named")" \
+            "$(cygpath -w packaging/windows/linnet.iss)"
           ls -la "$RUNNER_TEMP/named"
 
       - uses: actions/upload-artifact@v4
@@ -115,5 +136,15 @@ jobs:
         run: |
           ls -la dist
           [ -n "$(ls dist)" ] || { echo "::error::No packages were built"; exit 1; }
+          cat > notes.md <<'NOTES'
+          ## Which file to download
+
+          - **Windows:** `Linnet-…-windows-x64-setup.exe` installs Linnet for most PCs. On a Windows PC with an ARM processor (such as a Surface Pro X or a Copilot+ PC), take `…-windows-arm64-setup.exe` instead. The `.zip` files are the same app without an installer. The first time Linnet starts, it offers to download VLC, which it plays music with (about 80 MB, once).
+          - **macOS (Apple Silicon):** `Linnet-…-macos-arm64.zip` holds `Linnet.app`. It needs [VLC](https://www.videolan.org/vlc/) installed.
+          - **Linux:** the `.tar.gz` for your processor. It needs VLC (for example `sudo apt install vlc`).
+
+          These aren't signed yet: Windows SmartScreen asks first (choose **More info**, then **Run anyway**), and macOS asks you to allow the app in System Settings > Privacy & Security.
+          NOTES
           gh release create "$GITHUB_REF_NAME" dist/* \
-            --repo "$GITHUB_REPOSITORY" --draft --title "Linnet ${GITHUB_REF_NAME#v}" --generate-notes
+            --repo "$GITHUB_REPOSITORY" --draft --title "Linnet ${GITHUB_REF_NAME#v}" \
+            --notes-file notes.md --generate-notes
