@@ -1,0 +1,119 @@
+name: Release
+
+# A tag like v0.1.0 (matching skein.edn's :version) builds Linnet on each
+# platform and gathers the packages into a draft GitHub release, to check
+# and publish by hand. Run by hand, it builds the packages without a release.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  SKEIN_UI_HEADLESS: "1"
+  LINNET_VLC_OPTIONS: --aout=adummy
+
+jobs:
+  package:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: macOS arm64, os: macos-15, slug: macos-arm64, experimental: false }
+          - { name: Linux x86-64, os: ubuntu-24.04, slug: linux-x86_64, experimental: true }
+          - { name: Linux arm64, os: ubuntu-24.04-arm, slug: linux-arm64, experimental: true }
+          - { name: Windows x86-64, os: windows-latest, slug: windows-x86_64, experimental: true }
+          - { name: Windows arm64, os: windows-11-arm, slug: windows-arm64, experimental: true }
+    # (a platform that isn't ready yet leaves its package out, rather than
+    # stopping the release)
+    continue-on-error: ${{ matrix.experimental }}
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - run: git config --global core.autocrlf false
+
+      - uses: actions/checkout@v5
+        with:
+          path: linnet
+
+      - name: The tag matches skein.edn's version
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          version=$(grep -o ':version "[^"]*"' linnet/skein.edn | head -1 | cut -d'"' -f2)
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME, but skein.edn's :version is $version"
+            exit 1
+          fi
+
+      - uses: ./linnet/.github/actions/prepare
+
+      - name: Tests
+        working-directory: linnet
+        run: '"$SKEIN" test --serial tests'
+
+      - name: Package
+        working-directory: linnet
+        run: |
+          out="$RUNNER_TEMP/dist"
+          case "$RUNNER_OS" in
+            macOS) "$SKEIN" package --app --cli --out "$out" ;;
+            Linux) "$SKEIN" package --cli --out "$out" ;;
+            # A windowed Linnet.exe with its icon, in a zip, once skein
+            # package has --windows; until then the plain archive.
+            Windows)
+              if ! "$SKEIN" package --windows --out "$out"; then
+                echo "::warning::No skein package --windows in this Skein: making the plain archive"
+                "$SKEIN" package --cli --out "$out"
+              fi ;;
+          esac
+          # Each file named for its platform, so the release's names don't clash.
+          mkdir -p "$RUNNER_TEMP/named"
+          for f in "$out"/*; do
+            [ -f "$f" ] || continue
+            base=$(basename "$f")
+            case "$base" in
+              *.tar.gz) stem=${base%.tar.gz}; ext=tar.gz ;;
+              *.*) stem=${base%.*}; ext=${base##*.} ;;
+              *) stem=$base; ext= ;;
+            esac
+            stem=$(echo "$stem" | sed -E 's/-(macos|linux|windows)-(aarch64|arm64|x86_64|x86-64)$//')
+            cp "$f" "$RUNNER_TEMP/named/$stem-${{ matrix.slug }}${ext:+.$ext}"
+          done
+          ls -la "$RUNNER_TEMP/named"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linnet-${{ matrix.slug }}
+          path: ${{ runner.temp }}/named/*
+          if-no-files-found: error
+
+  release:
+    name: Draft release
+    needs: package
+    if: ${{ always() && startsWith(github.ref, 'refs/tags/') }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: linnet-*
+          merge-multiple: true
+
+      - name: Draft the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ls -la dist
+          [ -n "$(ls dist)" ] || { echo "::error::No packages were built"; exit 1; }
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --repo "$GITHUB_REPOSITORY" --draft --title "Linnet ${GITHUB_REF_NAME#v}" --generate-notes

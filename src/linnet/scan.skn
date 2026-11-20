@@ -1,0 +1,158 @@
+;;;; Finding music in folders: walk a music folder, read each new or changed
+;;;; file's tags with libVLC, and find its cover art. Files are only read.
+
+(ns linnet.scan
+  (:require [skein.crypto :as crypto]
+            [skein.fs :as fs]
+            [skein.io :as io]
+            [skein.string :as str]
+            [skein.sync :as sync]
+            [skein.uri :as uri]
+            [skein.vlc :as vlc]
+            [linnet.library :as library]
+            [linnet.store :as store]))
+
+(def extensions
+  "The audio files the library looks for, by extension."
+  #{"mp3" "m4a" "m4b" "aac" "flac" "ogg" "oga" "opus" "wav" "wma" "aif" "aiff" "ape" "wv" "mpc" "mka" "alac"})
+
+(defn audio-file? [path]
+  (contains? extensions (str/lower-case (or (io/extension path) ""))))
+
+(defn audio-files
+  "The audio files under folder, sorted. Hidden files (a name starting with
+  a dot, such as macOS's ._ copies) are left out."
+  [folder]
+  (vec (filter (fn [p] (and (audio-file? p)
+                            (not (str/starts-with? (io/file-name p) "."))
+                            (io/file? p)))
+               (fs/walk folder))))
+
+;; Cover pictures people and Windows Media Player keep beside the music.
+(def ^:private cover-names
+  ["cover.jpg" "cover.jpeg" "cover.png" "folder.jpg" "folder.jpeg" "folder.png"
+   "front.jpg" "front.png" "albumart.jpg" "albumartlarge.jpg" "albumartsmall.jpg"])
+
+(defn- folder-cover
+  "A cover picture in folder, matching names without regard to case."
+  [folder]
+  (let [names (into {} (map (fn [n] [(str/lower-case n) n])) (io/list-dir folder))]
+    (some (fn [c] (when-let [n (get names c)] (io/path folder n))) cover-names)))
+
+(defn- art-file
+  "The local file a cover URL from libVLC names, or nil."
+  [url]
+  (when-let [p (and url (str/starts-with? url "file:") (uri/file-path url))]
+    (when (io/file? p) p)))
+
+(defn- in-vlc-cache?
+  "Is path a cover in VLC's own art cache (…/vlc/art/… on Windows and
+  Linux, …/org.videolan.vlc/art/… on macOS), rather than a picture of the
+  listener's, such as a cover.jpg beside the music?"
+  [path]
+  (boolean (re-find #"[/\\](org\.videolan\.vlc|vlc)[/\\]art[/\\]" path)))
+
+(defn- keep-art!
+  "A copy of the cover at url in the app's own art folder, so it lasts if
+  VLC's cache is cleared: its path, or nil. The copy is named by what's in
+  it, so a new cover is a new file."
+  [url]
+  (when-let [src (art-file url)]
+    (let [bytes (io/read-bytes src)
+          ext (str/lower-case (or (io/extension src) "jpg"))
+          dest (io/path (store/art-dir) (str (subs (crypto/hex (crypto/sha256 bytes)) 0 24) "." ext))]
+      (when-not (io/file? dest)
+        (io/mkdirs! (store/art-dir))
+        (io/write-bytes dest bytes))
+      dest)))
+
+(defn- read-metadata [path]
+  (try (vlc/metadata path {:art? true :timeout-ms 15000})
+       (catch Error _ {})))
+
+(defn- stale?-cover
+  "Is cached, a cover in VLC's cache, older than the music file at path? VLC
+  files covers by artist and album and hands back the one it has, so a
+  cover changed in the file (or another file's cover for the same album
+  name) would show instead of the file's own."
+  [cached path]
+  (and (in-vlc-cache? cached)
+       (< (or (:modified (io/info cached)) 0) (or (:modified (io/info path)) 0))))
+
+(def ^:private refresh-permit
+  "Held while a stale cover is dropped and read again, so two songs of one
+  album read at once don't delete each other's fresh copy."
+  (sync/semaphore 1))
+
+(defn- current-metadata
+  "The tags of the file at path in music folder root, with VLC's cover for
+  it read again from the file when VLC's cached one is older than the file."
+  [root path]
+  (let [info (read-metadata path)
+        cached (art-file (:artwork-url info))]
+    (if (and cached (not (io/under? cached root)) (stale?-cover cached path))
+      (sync/with-permit refresh-permit
+        ;; (another song of the album may have refreshed it meanwhile)
+        (when-let [still (art-file (:artwork-url (read-metadata path)))]
+          (when (stale?-cover still path) (io/delete! still)))
+        (read-metadata path))
+      info)))
+
+(defn read-track
+  "The library's record of the audio file at path in music folder root."
+  [root path]
+  (let [info (current-metadata root path)
+        art (or (try (keep-art! (:artwork-url info)) (catch Error _ nil))
+                (folder-cover (io/parent path)))]
+    {:path path :root root
+     :tags (library/tags-from-metadata path info)
+     :duration-ms (:duration-ms info)
+     :art art
+     :modified (:modified (io/info path))
+     :added (nano-time)}))
+
+(defn- stale?
+  "Does the file at path need reading: new, or changed since it was read?"
+  [lib path]
+  (let [t (get-in lib [:tracks path])]
+    (or (nil? t) (not= (:modified t) (:modified (io/info path))))))
+
+(def batch-size 16)
+
+(defn scan!
+  "Bring music folder root up to date in the library held by atom lib-atom:
+  read new and changed files, a batch at a time (several at once), and
+  forget files that have gone. (on-progress {:root :done :total}) after
+  each batch. Returns the number of files read."
+  [lib-atom root on-progress]
+  (let [files (audio-files root)
+        todo (vec (filter (fn [p] (stale? @lib-atom p)) files))
+        total (count todo)]
+    (on-progress {:root root :done 0 :total total})
+    (loop [batches (partition-all batch-size todo) done 0]
+      (when-let [batch (first batches)]
+        (let [tracks (with-scope [s]
+                       (mapv await (mapv (fn [p] (spawn s (read-track root p))) batch)))
+              done (+ done (count batch))]
+          (swap! lib-atom library/put-tracks tracks)
+          (on-progress {:root root :done done :total total})
+          (recur (rest batches) done))))
+    (swap! lib-atom library/drop-missing root files)
+    total))
+
+(defn add-folder!
+  "Add a music folder to the library and scan it."
+  [lib-atom folder on-progress]
+  (let [folder (or (io/canonical folder) folder)]
+    (swap! lib-atom library/add-root folder)
+    (when (some #{folder} (:roots @lib-atom))
+      (scan! lib-atom folder on-progress))))
+
+(defn rescan-all!
+  "Scan every music folder again, for files added, changed or removed."
+  [lib-atom on-progress]
+  (doseq [root (:roots @lib-atom)]
+    (if (io/directory? root)
+      (scan! lib-atom root on-progress)
+      ;; (an unplugged drive: keep its tracks for when it returns)
+      nil)))

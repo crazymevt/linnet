@@ -1,0 +1,29 @@
+;;;; Download and unpack VLC as Linnet's setup window does, for this
+;;;; process's OS and architecture (Windows x64 or ARM64), into Linnet's data
+;;;; folder (LINNET_DATA_DIR, else the usual one). CI uses it to get libVLC,
+;;;; and to check the real VideoLAN zips. Elsewhere it says there's nothing
+;;;; to download. Run from the project folder:
+;;;;   skein tools/install-vlc.skn
+;;;; Under GitHub Actions it also sets SKEIN_VLC_LIBRARY for the later steps.
+
+(require '[skein.io :as io] '[skein.sys :as sys] '[linnet.setup :as setup])
+
+(def release (setup/vlc-release))
+
+(when-not release
+  (println "No VLC download for" (name (sys/os)) (name (sys/arch)) "- install VLC instead.")
+  (sys/exit 0))
+
+(println "Downloading VLC" (:version release) "from" (:url release))
+(def shown (atom -1))
+(def lib
+  (setup/install! release
+                  (fn [{:keys [stage done total]}]
+                    ;; (a line every 10 MB, and one for each later stage)
+                    (let [mark (if (= stage :downloading) (quot (or done 0) 10485760) stage)]
+                      (when (not= mark @shown)
+                        (reset! shown mark)
+                        (println " " (name stage) (if (= stage :downloading) (str (quot (or done 0) 1048576) " of " (quot (or total 0) 1048576) " MB") "")))))))
+(println "libVLC is at" lib)
+(when-let [env (not-empty (sys/getenv "GITHUB_ENV"))]
+  (io/append-text env (str "SKEIN_VLC_LIBRARY=" lib "\n")))

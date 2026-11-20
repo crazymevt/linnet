@@ -1,0 +1,905 @@
+;;;; Linnet's window: the navigation pane, the views (songs,
+;;;; artists, albums, genres, folders, playlists, now playing), the play
+;;;; list pane, the play bar and the dialogs, and what they do.
+;;;;
+;;;; Three atoms hold everything: the library (linnet.library), the player
+;;;; (linnet.player's state) and the window's own state below. The window
+;;;; shows ui-state, and watchers copy the other two into it.
+
+(ns linnet.app
+  (:require [skein.io :as io]
+            [skein.string :as str]
+            [skein.sys :as sys]
+            [skein.ui :as ui]
+            [linnet.library :as library]
+            [linnet.player :as player]
+            [linnet.scan :as scan]
+            [linnet.store :as store]
+            [linnet.theme :as theme]
+            [linnet.widgets :as w]))
+
+(def lib-atom (atom (library/empty-library)))
+(def ctl (atom nil))
+(def window-id (atom nil))
+(def ^:private started (atom false))
+
+(def ui-state
+  (atom {:lib nil :player nil
+         :view [:albums] :history []
+         :search "" :sort {:songs [:artist :asc]}
+         :selected {} :scroll {}
+         :folder nil :expanded #{}
+         :dialog nil :scan nil :message nil
+         :show-list? true :size [1240 800]}))
+
+;; ---- derived data, computed once per library ----
+
+(def ^:private derived (atom {:lib nil :m {}}))
+
+(defn- cached
+  "(f), remembered under k until the library changes."
+  [lib k f]
+  (let [d @derived]
+    (if (and (identical? lib (:lib d)) (contains? (:m d) k))
+      (get (:m d) k)
+      (let [v (f)]
+        (if (identical? lib (:lib d))
+          (swap! derived assoc-in [:m k] v)
+          (reset! derived {:lib lib :m {k v}}))
+        v))))
+
+(defn- all-tracks [lib] (library/tracks lib))
+(defn- albums [lib] (cached lib :albums #(library/albums (all-tracks lib))))
+(defn- artists [lib] (cached lib :artists #(library/artists (all-tracks lib))))
+(defn- genres [lib] (cached lib :genres #(library/genres (all-tracks lib))))
+(defn- folder-tree [lib] (cached lib :folder-tree #(library/folder-tree lib (all-tracks lib))))
+
+(defn- find-by [k v xs] (some (fn [x] (when (= v (get x k)) x)) xs))
+
+(defn- view-tracks
+  "The songs a view lists, in the order it lists them."
+  [lib {:keys [view search sort]}]
+  (let [[kind arg] view]
+    (if-not (str/blank? search)
+      (cached lib [:search search (:search sort)]
+              #(library/sort-tracks (library/search (all-tracks lib) search) (get sort :search [:artist :asc])))
+      (case kind
+        :songs (cached lib [:songs (:songs sort)] #(library/sort-tracks (all-tracks lib) (:songs sort)))
+        :album (:tracks (find-by :key arg (albums lib)))
+        :artist (cached lib [:artist arg] #(library/sort-tracks (filter (fn [t] (= arg (:artist t))) (all-tracks lib)) nil))
+        :genre (:tracks (find-by :name arg (genres lib)))
+        :folder (cached lib [:folder arg] #(library/folder-tracks (all-tracks lib) arg))
+        :playlist (library/playlist-tracks lib arg)
+        []))))
+
+(defn- table-key
+  "Which table's selection and scroll a view uses."
+  [{:keys [view search]}]
+  (if (str/blank? search) view [:search]))
+
+;; ---- actions ----
+
+(defn- lib [] @lib-atom)
+
+(defn go!
+  "Show view, remembering where we were for Back."
+  [view]
+  (swap! ui-state (fn [s] (if (= view (:view s))
+                            (assoc s :search "")
+                            (-> s (update :history (fn [h] (vec (take-last 30 (conj h (:view s))))))
+                                (assoc :view view :search "")))))
+  nil)
+
+(defn back! []
+  (swap! ui-state (fn [s] (if-let [v (peek (:history s))]
+                            (assoc s :view v :history (pop (:history s)) :search "")
+                            s))))
+
+(defn- play-tracks!
+  "Play tracks, starting with the one at i."
+  [tracks i]
+  (when (seq tracks) (player/play-queue! @ctl (mapv :path tracks) i)))
+
+(defn- shuffle-tracks! [tracks]
+  (when (seq tracks)
+    (when-not (:shuffle? (player/state @ctl)) (player/toggle-shuffle! @ctl))
+    (play-tracks! tracks (rand-int (count tracks)))))
+
+(defn- notify!
+  "A short message along the bottom of the window, for a few seconds."
+  [text]
+  (let [stamp (nano-time)]
+    (swap! ui-state assoc :message {:text text :stamp stamp})
+    (spawn-detached (sleep 3500) (swap! ui-state (fn [s] (if (= stamp (get-in s [:message :stamp])) (assoc s :message nil) s))))))
+
+(defn- focus-dialog! []
+  (spawn-detached (sleep 80) (when-let [wid @window-id] (ui/focus! wid :dialog-field))))
+
+(defn- open-dialog! [d] (swap! ui-state assoc :dialog d) (focus-dialog!))
+(defn- close-dialog! [] (swap! ui-state assoc :dialog nil))
+
+(defn edit-info!
+  "Open the form for changing a song's details."
+  [path]
+  (let [t (library/track (lib) path)]
+    (open-dialog! {:kind :edit :path path
+                   :values (into {} (map (fn [f] [f (let [v (get t f)] (if (nil? v) "" (str v)))])) library/fields)})))
+
+(defn- rename!
+  "Ask for a new name, then (on-save name)."
+  [title label value on-save]
+  (open-dialog! {:kind :rename :title title :label label :value value :on-save on-save}))
+
+(defn- confirm! [title message ok-label on-ok]
+  (open-dialog! {:kind :confirm :title title :message message :ok-label ok-label :on-ok on-ok}))
+
+(defn- new-playlist!
+  "Ask for a name, and make a playlist holding paths."
+  [paths]
+  (rename! "New playlist" "Name" ""
+           (fn [name]
+             (let [[l id] (library/new-playlist (lib) name)]
+               (reset! lib-atom (library/add-to-playlist l id paths))
+               (notify! (str "Made the playlist " (:name (library/playlist @lib-atom id))))))))
+
+(defn- progress! [p]
+  (swap! ui-state assoc :scan (when (< (:done p) (:total p)) p)))
+
+(defn- in-background
+  "Run (f) on a fiber of its own, telling the listener if it fails."
+  [f]
+  (spawn-detached
+    (handler-case (f)
+      (Error [c] (notify! (str "Something went wrong: " (condition-message c)))))))
+
+(defn add-folder!
+  "Ask for a music folder, add it and look through it."
+  []
+  (in-background
+    (fn []
+      (when-let [folder (ui/choose-file {:folder true :title "Choose a folder with music in it"})]
+        (go! [:albums])
+        (let [n (scan/add-folder! lib-atom folder progress!)]
+          (swap! ui-state assoc :scan nil)
+          (notify! (str "Found " (w/songs-label n) " in " (io/file-name folder))))))))
+
+(defn rescan! []
+  (in-background
+    (fn []
+      (scan/rescan-all! lib-atom progress!)
+      (swap! ui-state assoc :scan nil)
+      (notify! "Your library is up to date"))))
+
+(defn- add-paths!
+  "Files and folders dropped on the window: folders join the library,
+  songs go to the end of the play list."
+  [paths]
+  (let [folders (filter io/directory? paths)
+        songs (filter (fn [p] (and (io/file? p) (scan/audio-file? p))) paths)]
+    (when (seq songs)
+      (in-background
+        (fn []
+          (let [unknown (remove (fn [p] (get-in (lib) [:tracks p])) songs)]
+            (when (seq unknown)
+              ;; (a song from outside the library: read it so it shows properly)
+              (swap! lib-atom library/put-tracks (mapv (fn [p] (scan/read-track (io/parent p) p)) unknown))))
+          (player/enqueue! @ctl (vec songs))
+          (notify! (str "Added " (w/songs-label (count songs)) " to the play list")))))
+    (doseq [f folders]
+      (in-background
+        (fn []
+          (let [n (scan/add-folder! lib-atom f progress!)]
+            (swap! ui-state assoc :scan nil)
+            (notify! (str "Found " (w/songs-label n) " in " (io/file-name f)))))))))
+
+;; ---- the song context menu ----
+
+(defn- playlist-menu [prefix]
+  (let [ps (:playlists (lib))]
+    (if (seq ps)
+      [["Add to playlist" (conj (mapv (fn [p] [(:name p) (keyword (str prefix (:id p)))]) ps)
+                                :separator ["New playlist…" :add-to-new])]]
+      [["Add to a new playlist…" :add-to-new]])))
+
+(defn- track-menu
+  "The right-click menu for a song in view."
+  [view t]
+  (let [edited? (seq (:edited t))]
+    (vec (concat [["Play" :play] ["Play next" :play-next] ["Add to play list" :enqueue] :separator]
+                 (playlist-menu "add-to:")
+                 [:separator ["Edit info…" :edit]]
+                 (when edited? [["Use the file's own info" :restore]])
+                 (when (= :playlist (first view))
+                   [:separator ["Move up" :move-up] ["Move down" :move-down] ["Remove from this playlist" :remove-from-playlist]])
+                 [:separator ["Remove from library…" :hide]]))))
+
+(defn- track-command!
+  "Do command for the song at row i of tracks, in view."
+  [view tracks i command]
+  (let [t (nth tracks i)
+        path (:path t)
+        cmd (name command)]
+    (swap! ui-state assoc-in [:selected (table-key @ui-state)] i)
+    (cond
+      (= command :play) (play-tracks! tracks i)
+      (= command :play-next) (do (player/play-next! @ctl [path]) (notify! (str "“" (:title t) "” plays next")))
+      (= command :enqueue) (do (player/enqueue! @ctl [path]) (notify! (str "Added “" (:title t) "” to the play list")))
+      (= command :edit) (edit-info! path)
+      (= command :restore) (swap! lib-atom library/restore-track path)
+      (= command :add-to-new) (new-playlist! [path])
+      (str/starts-with? cmd "add-to:")
+      (let [id (subs cmd 7)]
+        (swap! lib-atom library/add-to-playlist id [path])
+        (notify! (str "Added to " (:name (library/playlist (lib) id)))))
+      (= command :move-up) (when (pos? i) (swap! lib-atom library/move-in-playlist (second view) i (dec i)))
+      (= command :move-down) (swap! lib-atom library/move-in-playlist (second view) i (inc i))
+      (= command :remove-from-playlist) (swap! lib-atom library/remove-from-playlist (second view) [i])
+      (= command :hide)
+      (confirm! "Remove from library?"
+                (str "“" (:title t) "” will no longer show in your library. The file itself stays where it is.")
+                "Remove" (fn [] (swap! lib-atom library/hide-tracks [path])))
+      :else nil)))
+
+;; ---- the navigation pane ----
+
+(defn- section-label [text]
+  [:box {:padding [14 12 6 12]} [:text {:class :nav-heading} text]])
+
+(defn- nav-item [{:keys [id icon label view current badge menu on-command]}]
+  (let [selected? (= view current)]
+    [:row (cond-> {:key id :id id :class :nav-item :selected selected? :gap 10 :align-items :center
+                   :on-click (fn [_] (go! view))}
+            menu (assoc :context-menu menu :on-command on-command))
+     (theme/icon icon 18 (if selected? :accent :muted))
+     [:text {:font-size 14 :flex-grow 1 :white-space :nowrap :font-weight (when selected? :bold)} label]
+     (when badge [:text {:class :muted :font-size 12} badge])]))
+
+(defn- top-kind
+  "The section of the navigation pane a view belongs to."
+  [[kind arg]]
+  (case kind :album [:albums] :artist [:artists] :genre [:genres] :folder [:folders] [kind arg]))
+
+(defn- nav [lib view scan]
+  (let [current (top-kind view)]
+    [:column {:width 230 :flex-shrink 0 :background :nav :padding [10 10] :gap 2}
+     [:row {:gap 10 :align-items :center :padding [6 10 12 10]}
+      (theme/logo 36)
+      [:text {:font-size 18 :font-weight :bold} "Linnet"]]
+     (section-label "LIBRARY")
+     (nav-item {:id :nav-albums :icon :disc :label "Albums" :view [:albums] :current current})
+     (nav-item {:id :nav-artists :icon :person :label "Artists" :view [:artists] :current current})
+     (nav-item {:id :nav-songs :icon :note :label "Songs" :view [:songs] :current current})
+     (nav-item {:id :nav-genres :icon :tag :label "Genres" :view [:genres] :current current})
+     (nav-item {:id :nav-folders :icon :folder :label "Folders" :view [:folders] :current current})
+     (nav-item {:id :nav-now :icon :now-playing :label "Now Playing" :view [:now-playing] :current current})
+     [:row {:align-items :center}
+      [:box {:flex-grow 1} (section-label "PLAYLISTS")]
+      (w/icon-button {:id :new-playlist :icon :plus :size 16 :color :muted :tooltip "Make a new playlist"
+                      :on-click (fn [] (new-playlist! []))})]
+     [:scroll {:flex-grow 1 :min-height 0}
+      [:column {:gap 2}
+       (if (empty? (:playlists lib))
+         [:text {:class :muted :font-size 13 :padding [4 12]} "Right-click a song to add it to a playlist."]
+         (for [p (:playlists lib)]
+           (nav-item {:id (keyword (str "nav-" (:id p))) :icon :playlist :label (:name p)
+                      :view [:playlist (:id p)] :current current :badge (str (count (:paths p)))
+                      :menu [["Play" :play] ["Rename…" :rename] :separator ["Delete playlist…" :delete]]
+                      :on-command (fn [e]
+                                    (case (:command e)
+                                      :play (play-tracks! (library/playlist-tracks (lib) (:id p)) 0)
+                                      :rename (rename! "Rename playlist" "Name" (:name p)
+                                                       (fn [n] (swap! lib-atom library/rename-playlist (:id p) n)))
+                                      :delete (confirm! "Delete this playlist?"
+                                                        (str "“" (:name p) "” will be deleted. The songs stay in your library.")
+                                                        "Delete" (fn []
+                                                                   (swap! lib-atom library/delete-playlist (:id p))
+                                                                   (when (= [:playlist (:id p)] (:view @ui-state)) (go! [:albums]))))
+                                      nil))})))]]
+     (when scan
+       [:column {:gap 6 :padding [10 12]}
+        [:text {:font-size 12 :class :muted} "Adding music… " (:done scan) " of " (:total scan)]
+        [:box {:height 4 :border-radius 2 :background :line}
+         [:box {:height 4 :border-radius 2 :background :accent
+                :width [:% (* 100.0 (/ (:done scan) (max 1 (:total scan))))]}]]])
+     [:row {:id :manage-folders :class :nav-item :gap 10 :align-items :center
+            :on-click (fn [_] (open-dialog! {:kind :folders}))}
+      (theme/icon :music-folder 18 :muted)
+      [:text {:font-size 13 :class :muted} "Music folders"]]]))
+
+;; ---- the top bar ----
+
+(def ^:private view-titles
+  {:songs "Songs" :artists "Artists" :albums "Albums" :genres "Genres" :folders "Folders" :now-playing "Now Playing"})
+
+(defn- top-bar [{:keys [view history search]}]
+  [:row {:height 56 :flex-shrink 0 :align-items :center :gap 10 :padding [0 20] :background :panel}
+   (when (seq history)
+     (w/icon-button {:id :back :icon :back :tooltip "Back" :on-click back!}))
+   [:spacer]
+   [:row {:align-items :center :gap 6}
+    (theme/icon :search 16 :muted)
+    [:text-field {:id :search :class :search :value search :placeholder "Search your music" :width 260
+                  :on-input (fn [e] (swap! ui-state (fn [s] (-> s (assoc :search (:value e))
+                                                                (assoc-in [:scroll [:search]] 0)
+                                                                (assoc-in [:selected [:search]] nil)))))}]
+    (when-not (str/blank? search)
+      (w/icon-button {:id :clear-search :icon :x :size 14 :tooltip "Clear the search"
+                      :on-click (fn [] (swap! ui-state assoc :search ""))}))]
+   (w/button {:id :add-folder :label "Add music" :icon :plus :kind :secondary :on-click add-folder!})])
+
+;; ---- views ----
+
+(defn- heading
+  "A view's title, a line under it, and its buttons below them (so a long
+  name never runs under them)."
+  [title subtitle & buttons]
+  [:column {:padding [18 24 14 24] :gap 2 :flex-shrink 0 :min-width 0 :overflow :hidden}
+   [:text {:font-size 26 :font-weight :bold :white-space :nowrap} title]
+   (when subtitle [:text {:class :muted :font-size 14 :white-space :nowrap} subtitle])
+   (when (seq (remove nil? buttons))
+     (into [:row {:gap 8 :align-items :center :padding [10 0 0 0]}] buttons))])
+
+(defn- table
+  "The song table for a view's tracks."
+  [s tracks columns {:keys [sortable?]}]
+  (let [k (table-key s)
+        sort-k (if (str/blank? (:search s)) (first (:view s)) :search)
+        order (get-in s [:sort sort-k] (when sortable? [:artist :asc]))
+        current (player/current-path (:player s))
+        [_ h] (:size s)]
+    (w/track-table
+      {:id :songs-table :rows tracks :columns columns
+       :sort (when sortable? order)
+       :on-sort (when sortable?
+                  (fn [col] (swap! ui-state update-in [:sort sort-k]
+                                   (fn [[c d]] [col (if (and (= c col) (= d :asc)) :desc :asc)]))))
+       :selected (get-in s [:selected k])
+       :on-select (fn [i] (swap! ui-state assoc-in [:selected k] i))
+       :on-play (fn [i] (play-tracks! tracks i))
+       :menu (fn [i] (track-menu (:view s) (nth tracks i)))
+       :on-command (fn [i c] (track-command! (:view s) tracks i c))
+       :current current
+       :scroll-y (get-in s [:scroll k] 0)
+       :on-scroll (fn [y] (swap! ui-state assoc-in [:scroll k] y))
+       :viewport (+ h 200)})))
+
+(defn- empty-note [icon title text]
+  [:column {:flex-grow 1 :align-items :center :justify-content :center :gap 10 :padding 40}
+   (theme/icon icon 40 :muted)
+   [:text {:font-size 18 :font-weight :bold} title]
+   [:text {:class :muted :font-size 14 :text-align :center :max-width 420} text]])
+
+(defn- songs-view [s]
+  (let [tracks (view-tracks (:lib s) s)]
+    [:column {:flex-grow 1 :min-height 0}
+     (heading "Songs" (str (w/songs-label (count tracks)) " · " (w/total-time (reduce + 0 (keep :duration-ms tracks))))
+              (w/button {:id :play-all :label "Play all" :icon :play :on-click (fn [] (play-tracks! tracks 0))})
+              (w/button {:id :shuffle-all :label "Shuffle" :icon :shuffle :kind :secondary :on-click (fn [] (shuffle-tracks! tracks))}))
+     (table s tracks w/standard-columns {:sortable? true})]))
+
+(defn- search-view [s]
+  (let [tracks (view-tracks (:lib s) s)]
+    [:column {:flex-grow 1 :min-height 0}
+     (heading (str "Results for “" (str/trim (:search s)) "”") (w/songs-label (count tracks))
+              (when (seq tracks) (w/button {:id :play-results :label "Play these" :icon :play :on-click (fn [] (play-tracks! tracks 0))})))
+     (if (empty? tracks)
+       (empty-note :search "No songs match" "Try fewer words, or part of a name.")
+       (table s tracks w/standard-columns {:sortable? true}))]))
+
+(defn- album-menu [a]
+  [["Play" :play] ["Shuffle" :shuffle] ["Add to play list" :enqueue] :separator ["Rename album…" :rename]])
+
+(defn- album-command! [a command]
+  (case command
+    :play (play-tracks! (:tracks a) 0)
+    :shuffle (shuffle-tracks! (:tracks a))
+    :enqueue (do (player/enqueue! @ctl (mapv :path (:tracks a))) (notify! (str "Added " (:name a) " to the play list")))
+    :rename (rename! "Rename album" "Album name" (:name a)
+                     (fn [n] (swap! lib-atom library/rename-album (:key a) n)
+                       (when (= [:album (:key a)] (:view @ui-state))
+                         (swap! ui-state assoc :view [:album [(first (:key a)) (str/trim n)]]))))
+    nil))
+
+(defn- albums-view [s]
+  (let [as (albums (:lib s))]
+    [:column {:flex-grow 1 :min-height 0}
+     (heading "Albums" (str (count as) (if (= 1 (count as)) " album" " albums")))
+     (w/tiles
+       (for [[i a] (map-indexed vector as)]
+         (w/tile {:key (:key a) :id (keyword (str "album-" i)) :art (:art a) :name (:name a)
+                  :title (:name a) :subtitle (:artist a)
+                  :on-open (fn [] (go! [:album (:key a)]))
+                  :menu (album-menu a) :on-command (fn [e] (album-command! a (:command e)))})))]))
+
+(defn- album-view [s]
+  (let [k (second (:view s))
+        a (find-by :key k (albums (:lib s)))]
+    (if-not a
+      (empty-note :disc "This album is empty" "Its songs may have been renamed or removed.")
+      [:column {:flex-grow 1 :min-height 0}
+       [:row {:padding [20 24] :gap 22 :align-items :end :flex-shrink 0}
+        (w/cover {:art (:art a) :name (:name a) :size 180 :radius 12})
+        [:column {:gap 6 :flex-grow 1 :flex-shrink 1 :flex-basis 0 :min-width 0}
+         [:text {:class :muted :font-size 12 :font-weight :bold} "ALBUM"]
+         [:text {:font-size 30 :font-weight :bold :white-space :nowrap} (:name a)]
+         [:row {:id :album-artist :class :link :on-click (fn [_] (go! [:artist (:artist a)]))}
+          [:text {:font-size 16 :color :accent} (:artist a)]]
+         [:text {:class :muted :font-size 14}
+          (str/join " · " (remove nil? [(:year a) (w/songs-label (count (:tracks a))) (w/total-time (:duration-ms a))]))]
+         [:row {:gap 8 :padding [8 0 0 0]}
+          (w/button {:id :play-album :label "Play" :icon :play :on-click (fn [] (play-tracks! (:tracks a) 0))})
+          (w/button {:id :shuffle-album :label "Shuffle" :icon :shuffle :kind :secondary :on-click (fn [] (shuffle-tracks! (:tracks a)))})
+          (w/button {:id :rename-album :label "Rename" :icon :pencil :kind :secondary :on-click (fn [] (album-command! a :rename))})]]]
+       (table s (:tracks a) (remove (fn [c] (#{:album :genre} (:key c))) w/standard-columns) {})])))
+
+(defn- group-tiles
+  "Tiles for artists or genres, opening view kind."
+  [s title groups kind noun]
+  [:column {:flex-grow 1 :min-height 0}
+   (heading title (str (count groups) " " noun (when (not= 1 (count groups)) "s")))
+   (w/tiles
+     (for [[i g] (map-indexed vector groups)]
+       (w/tile {:key (:name g) :id (keyword (str (name kind) "-" i)) :art (:art g) :name (:name g)
+                :title (:name g)
+                :subtitle (str (w/songs-label (count (:tracks g))) (when (> (:albums g) 1) (str " · " (:albums g) " albums")))
+                :on-open (fn [] (go! [kind (:name g)]))
+                :menu [["Play" :play] ["Shuffle" :shuffle] :separator [(str "Rename " noun "…") :rename]]
+                :on-command (fn [e]
+                              (case (:command e)
+                                :play (play-tracks! (:tracks g) 0)
+                                :shuffle (shuffle-tracks! (:tracks g))
+                                :rename (rename! (str "Rename " noun) (str (str/capitalize noun) " name") (:name g)
+                                                 (fn [n] (swap! lib-atom (if (= kind :artist) library/rename-artist library/rename-genre)
+                                                                (:name g) n)))
+                                nil))})))])
+
+(defn- group-view
+  "One artist's or genre's songs."
+  [s kind noun]
+  (let [name (second (:view s))
+        tracks (view-tracks (:lib s) s)
+        rename-fn (if (= kind :artist) library/rename-artist library/rename-genre)]
+    (if (empty? tracks)
+      (empty-note :person (str "No songs for " name) "They may have been renamed or removed.")
+      [:column {:flex-grow 1 :min-height 0}
+       (heading name (str (str/capitalize noun) " · " (w/songs-label (count tracks)) " · "
+                          (w/total-time (reduce + 0 (keep :duration-ms tracks))))
+                (w/button {:id :play-group :label "Play" :icon :play :on-click (fn [] (play-tracks! tracks 0))})
+                (w/button {:id :shuffle-group :label "Shuffle" :icon :shuffle :kind :secondary :on-click (fn [] (shuffle-tracks! tracks))})
+                (w/button {:id :rename-group :label "Rename" :icon :pencil :kind :secondary
+                           :on-click (fn [] (rename! (str "Rename " noun) (str (str/capitalize noun) " name") name
+                                                     (fn [n] (swap! lib-atom rename-fn name n)
+                                                       (swap! ui-state assoc :view [kind (str/trim n)]))))}))
+       (table s tracks (remove (fn [c] (= kind (:key c))) w/standard-columns) {})])))
+
+(defn- folder-nodes
+  "The folder tree as ui/tree nodes, with song counts."
+  [nodes]
+  (mapv (fn [n] {:id (:id n) :label (:label n) :icon :folder :icon-color "#d4a340"
+                 :badge (str (:count n)) :children (folder-nodes (:children n))})
+        nodes))
+
+(defn- folders-view [s]
+  (let [lib (:lib s)
+        tree (folder-tree lib)
+        folder (or (second (:view s)) (:folder s) (:id (first tree)))
+        tracks (if folder (view-tracks lib (assoc s :view [:folder folder])) [])
+        s (assoc s :view [:folder folder])]
+    (if (empty? tree)
+      (empty-note :folder "No folders yet" "Add the folder where you keep your music, and its folders show here.")
+      [:row {:flex-grow 1 :min-height 0}
+       [:column {:width 240 :flex-shrink 0 :background :panel}
+        [:box {:padding [6 4 0 4]} (section-label "YOUR FOLDERS")]
+        [:scroll {:flex-grow 1 :min-height 0}
+         [:column {:padding [0 8 8 8]}
+          (ui/tree {:id :folder-tree :nodes (folder-nodes tree) :selected folder
+                    ;; (the music folders start open)
+                    :expanded (if (:folders-touched? s) (:expanded s) (into (:expanded s) (map :id tree)))
+                    :on-toggle (fn [id] (swap! ui-state (fn [st]
+                                                          (let [e (if (:folders-touched? st) (:expanded st) (into (:expanded st) (map :id tree)))]
+                                                            (assoc st :folders-touched? true
+                                                                   :expanded (if (contains? e id) (disj e id) (conj e id)))))))
+                    :on-select (fn [id] (swap! ui-state (fn [st] (-> st (assoc :folder id :view [:folders])
+                                                                    (update :expanded conj id)))))})]]]
+       [:box {:width 1 :background :line}]
+       [:column {:flex-grow 1 :flex-shrink 1 :flex-basis 0 :min-height 0 :min-width 0 :overflow :hidden}
+        (heading (library/folder-name lib folder)
+                 (str (w/songs-label (count tracks))
+                      (when (not= (library/folder-name lib folder) (io/file-name folder))
+                        (str " · on disk: " (io/file-name folder))))
+                 (w/button {:id :play-folder :label "Play" :icon :play :on-click (fn [] (play-tracks! tracks 0))})
+                 (w/button {:id :shuffle-folder :label "Shuffle" :icon :shuffle :kind :secondary :on-click (fn [] (shuffle-tracks! tracks))})
+                 (w/button {:id :rename-folder :label "Rename" :icon :pencil :kind :secondary
+                            :on-click (fn [] (rename! "Rename folder" "Name shown in Linnet" (library/folder-name lib folder)
+                                                      (fn [n] (swap! lib-atom library/rename-folder folder n))))}))
+        (table s tracks (remove (fn [c] (#{:track-number :genre :year} (:key c))) w/standard-columns) {})]])))
+
+(defn- playlist-view [s]
+  (let [id (second (:view s))
+        p (library/playlist (:lib s) id)
+        tracks (view-tracks (:lib s) s)]
+    (if-not p
+      (empty-note :playlist "This playlist is gone" "It may have been deleted.")
+      [:column {:flex-grow 1 :min-height 0}
+       (heading (:name p) (str "Playlist · " (w/songs-label (count tracks)) " · "
+                               (w/total-time (reduce + 0 (keep :duration-ms tracks))))
+                (when (seq tracks) (w/button {:id :play-playlist :label "Play" :icon :play :on-click (fn [] (play-tracks! tracks 0))}))
+                (when (seq tracks) (w/button {:id :shuffle-playlist :label "Shuffle" :icon :shuffle :kind :secondary :on-click (fn [] (shuffle-tracks! tracks))}))
+                (w/button {:id :rename-playlist :label "Rename" :icon :pencil :kind :secondary
+                           :on-click (fn [] (rename! "Rename playlist" "Name" (:name p)
+                                                     (fn [n] (swap! lib-atom library/rename-playlist id n))))}))
+       (if (empty? tracks)
+         (empty-note :playlist "This playlist is empty" "Right-click any song and choose Add to playlist.")
+         (table s tracks (into [(w/column :n "#" 52 {:render (fn [t] "")})] (rest w/standard-columns)) {}))])))
+
+(defn- now-playing-view [s]
+  (let [ps (:player s)
+        t (when-let [p (player/current-path ps)] (library/track (:lib s) p))]
+    (if-not t
+      (empty-note :now-playing "Nothing is playing" "Double-click a song, or choose Play on an album, to start.")
+      [:row {:flex-grow 1 :min-height 0 :padding 40 :gap 40 :align-items :center :justify-content :center}
+       (w/cover {:art (:art t) :name (:album t) :size 340 :radius 16})
+       [:column {:gap 10 :max-width 480}
+        [:text {:class :muted :font-size 12 :font-weight :bold} "NOW PLAYING"]
+        [:text {:font-size 34 :font-weight :bold} (:title t)]
+        [:row {:id :np-artist :class :link :on-click (fn [_] (go! [:artist (:artist t)]))}
+         [:text {:font-size 20 :color :accent} (:artist t)]]
+        [:row {:id :np-album :class :link :on-click (fn [_] (go! [:album (library/album-key t)]))}
+         [:text {:font-size 16 :class :muted} (:album t) (when (:year t) (str " · " (:year t)))]]
+        [:row {:gap 8 :padding [14 0 0 0]}
+         (w/button {:id :np-edit :label "Edit info" :icon :pencil :kind :secondary :on-click (fn [] (edit-info! (:path t)))})]]])))
+
+(defn- welcome-view []
+  [:column {:flex-grow 1 :align-items :center :justify-content :center :gap 14 :padding 40}
+   (theme/logo 112)
+   [:text {:font-size 28 :font-weight :bold} "Welcome to Linnet"]
+   [:text {:class :muted :font-size 16 :text-align :center :max-width 460}
+    "Choose the folder where you keep your music. Linnet only reads your files: renaming songs, albums and folders here never changes them."]
+   [:row {:padding [8 0 0 0]}
+    (w/button {:id :welcome-add :label "Choose your music folder" :icon :folder :on-click add-folder!})]])
+
+(defn- content [s]
+  (let [lib (:lib s) [kind] (:view s)]
+    (cond
+      (empty? (:roots lib)) (welcome-view)
+      (not (str/blank? (:search s))) (search-view s)
+      :else (case kind
+              :songs (songs-view s)
+              :albums (albums-view s)
+              :album (album-view s)
+              :artists (group-tiles s "Artists" (artists lib) :artist "artist")
+              :artist (group-view s :artist "artist")
+              :genres (group-tiles s "Genres" (genres lib) :genre "genre")
+              :genre (group-view s :genre "genre")
+              (:folders :folder) (folders-view s)
+              :playlist (playlist-view s)
+              :now-playing (now-playing-view s)
+              (albums-view s)))))
+
+;; ---- the play list pane ----
+
+(defn- queue-pane [s]
+  (let [ps (:player s)
+        lib (:lib s)
+        q (:queue ps)
+        cur (player/current-index ps)
+        upcoming (if (:shuffle? ps) (:order ps) (range (count q)))]
+    [:column {:width 300 :flex-shrink 0 :background :panel}
+     [:row {:padding [16 12 8 16] :align-items :center}
+      [:column {:flex-grow 1}
+       [:text {:font-size 16 :font-weight :bold} "Play list"]
+       [:text {:class :muted :font-size 12}
+        (if (empty? q) "Empty" (str (w/songs-label (count q)) " · "
+                                    (w/total-time (reduce + 0 (keep (fn [p] (get-in lib [:tracks p :duration-ms])) q)))))]]
+      (when (seq q)
+        (w/icon-button {:id :save-queue :icon :playlist :tooltip "Save as a playlist"
+                        :on-click (fn [] (new-playlist! q))}))
+      (when (seq q)
+        (w/icon-button {:id :clear-queue :icon :x :tooltip "Clear the play list" :on-click (fn [] (player/clear-queue! @ctl))}))]
+     [:box {:height 1 :background :line}]
+     (if (empty? q)
+       [:column {:padding 20 :gap 6}
+        [:text {:class :muted :font-size 13} "Songs you play show here. Right-click a song and choose Add to play list to line it up."]]
+       [:scroll {:flex-grow 1 :min-height 0}
+        [:column {:padding 6 :gap 1}
+         (for [i upcoming]
+           (let [path (nth q i)
+                 t (or (library/track lib path) {:title (io/stem path) :artist ""})
+                 here? (= i cur)]
+             [:row {:key i :id (keyword (str "queue-" i)) :class :queue-row :selected here? :gap 10 :align-items :center
+                    :on-click (fn [e] (when (= 2 (:count e)) (player/play-at! @ctl i)))
+                    :context-menu [["Play" :play] :separator ["Move up" :up] ["Move down" :down] ["Remove from play list" :remove]]
+                    :on-command (fn [e]
+                                  (case (:command e)
+                                    :play (player/play-at! @ctl i)
+                                    :up (player/move-in-queue! @ctl i (dec i))
+                                    :down (player/move-in-queue! @ctl i (inc i))
+                                    :remove (player/remove-from-queue! @ctl i)
+                                    nil))}
+              [:box {:width 18 :align-items :center}
+               (if here? (theme/icon :now-playing 16 :accent) [:text {:class :muted :font-size 11} ""])]
+              [:column {:flex-grow 1 :flex-shrink 1 :flex-basis 0 :min-width 0}
+               [:text {:font-size 14 :white-space :nowrap :font-weight (when here? :bold) :color (when here? :accent)} (:title t)]
+               [:text {:class :muted :font-size 12 :white-space :nowrap} (:artist t)]]
+              [:text {:class :muted :font-size 12} (w/clock (:duration-ms t))]]))]])]))
+
+;; ---- the play bar ----
+
+(defn- transport [id icon tooltip on-click on?]
+  [:box {:id id :class :transport :tooltip tooltip :on-click (fn [_] (on-click))}
+   (theme/icon icon 20 (if on? "#7fb2ff" :bar-muted))])
+
+(defn- play-bar [s]
+  (let [ps (:player s)
+        st (:status ps)
+        t (when-let [p (player/current-path ps)] (library/track (:lib s) p))
+        playing? (= :playing (:state st))
+        length (or (:length-ms st) (:duration-ms t))
+        time (or (:time-ms st) 0)
+        [ww] (:size s)
+        ;; (the two sides take 270 each, the times and gaps about 170)
+        seek-w (max 160 (min 560 (- ww 760)))]
+    [:row {:id :play-bar :height 92 :flex-shrink 0 :background :bar :padding [0 20] :align-items :center :gap 12
+           :overflow :hidden}
+     ;; what's playing
+     [:row {:width 270 :flex-shrink 0 :gap 12 :align-items :center :min-width 0}
+      (if t
+        [:row {:id :bar-cover :class :link :on-click (fn [_] (go! [:now-playing]))}
+         (w/cover {:art (:art t) :name (:album t) :size 60 :radius 8})]
+        [:box {:width 60 :height 60 :border-radius 8 :background :bar-hover}])
+      [:column {:flex-grow 1 :flex-shrink 1 :flex-basis 0 :min-width 0 :gap 2}
+       [:text {:color :bar-text :font-size 15 :font-weight :bold :white-space :nowrap} (if t (:title t) "Not playing")]
+       [:text {:color :bar-muted :font-size 13 :white-space :nowrap} (when t (str (:artist t) " — " (:album t)))]]]
+     ;; the controls and the seek bar
+     [:column {:flex-grow 1 :flex-shrink 1 :flex-basis 0 :min-width 0 :align-items :center :gap 4}
+      [:row {:gap 10 :align-items :center}
+       (transport :shuffle :shuffle (if (:shuffle? ps) "Shuffle is on" "Shuffle") (fn [] (player/toggle-shuffle! @ctl)) (:shuffle? ps))
+       (transport :previous :previous "Previous" (fn [] (player/previous! @ctl)) false)
+       [:box {:id :play-pause :class :big-play :tooltip (if playing? "Pause" "Play")
+              :on-click (fn [_] (player/toggle! @ctl))}
+        (theme/icon (if playing? :pause :play) 24 :bar)]
+       (transport :next :next "Next" (fn [] (player/next! @ctl)) false)
+       [:box {:id :repeat :class :transport :flex-direction :row :align-items :center
+              :tooltip (case (:repeat ps) :all "Repeating the play list" :one "Repeating this song" "Repeat")
+              :on-click (fn [_] (player/cycle-repeat! @ctl))}
+        (theme/icon :repeat 20 (if (= :off (:repeat ps)) :bar-muted "#7fb2ff"))
+        (when (= :one (:repeat ps)) [:text {:color "#7fb2ff" :font-size 11 :font-weight :bold} "1"])]]
+      [:row {:gap 10 :align-items :center}
+       [:text {:color :bar-muted :font-size 12 :width 44 :text-align :right} (w/clock (when t time))]
+       (w/bar {:value (if (and t length (pos? length)) (/ (double time) length) 0.0) :width seek-w
+               :on-change (fn [f] (when (and t length) (player/seek! @ctl (* f length))))})
+       [:text {:color :bar-muted :font-size 12 :width 44} (w/clock (when t length))]]]
+     ;; the volume
+     [:row {:width 270 :flex-shrink 0 :gap 6 :align-items :center :justify-content :end}
+      (transport :list :list (if (:show-list? s) "Hide the play list" "Show the play list")
+                 (fn [] (swap! ui-state update :show-list? not)) (:show-list? s))
+      (transport :mute (if (:muted? ps) :muted :volume) (if (:muted? ps) "Unmute" "Mute") (fn [] (player/toggle-mute! @ctl)) false)
+      (w/bar {:value (if (:muted? ps) 0.0 (/ (or (:volume ps) 0) 100.0)) :width 110
+              :on-change (fn [f] (player/set-volume! @ctl (int (+ 0.5 (* 100 f)))))})]]))
+
+;; ---- dialogs ----
+
+(defn- field [{:keys [id label value on-input on-submit hint]}]
+  [:column {:gap 4}
+   [:text {:font-size 13 :font-weight :bold} label]
+   [:text-field {:id id :value value :width 420 :on-input (fn [e] (on-input (:value e)))
+                 :on-submit (fn [_] (when on-submit (on-submit)))}]
+   (when hint [:text {:class :muted :font-size 12} hint])])
+
+(defn- dialog-card [title body buttons]
+  [:column {:class :dialog :width 480 :gap 16}
+   [:text {:font-size 20 :font-weight :bold} title]
+   body
+   (into [:row {:gap 8 :justify-content :end :padding [6 0 0 0]}] buttons)])
+
+(defn- edit-dialog [s d]
+  (let [lib (:lib s)
+        path (:path d)
+        orig (library/original lib path)
+        save! (fn []
+                (swap! lib-atom library/edit-track path (:values (:dialog @ui-state)))
+                (close-dialog!)
+                (notify! "Saved. The file itself is unchanged."))
+        set-value (fn [f] (fn [v] (swap! ui-state assoc-in [:dialog :values f] v)))]
+    (dialog-card "Edit song info"
+                 [:column {:gap 10}
+                  [:text {:class :muted :font-size 13 :wrap true} (io/file-name path)]
+                  [:scroll {:max-height 430}
+                   [:column {:gap 10}
+                    (for [[i f] (map-indexed vector library/fields)]
+                      (let [v (get-in d [:values f])
+                            o (get orig f)
+                            o (if (nil? o) "" (str o))]
+                        [:box {:key f}
+                         (field {:id (if (zero? i) :dialog-field (keyword (str "field-" (name f))))
+                                 :label (get library/field-labels f) :value v
+                                 :on-input (set-value f) :on-submit save!
+                                 :hint (when (not= (str/trim v) o)
+                                         (str "The file says: " (if (str/blank? o) "(nothing)" o)))})]))]]]
+                 [(w/button {:id :restore-info :label "Use the file's info" :kind :secondary
+                             :on-click (fn [] (swap! ui-state assoc-in [:dialog :values]
+                                                     (into {} (map (fn [f] [f (let [v (get orig f)] (if (nil? v) "" (str v)))])) library/fields)))})
+                  [:spacer]
+                  (w/button {:id :cancel :label "Cancel" :kind :secondary :on-click close-dialog!})
+                  (w/button {:id :save :label "Save" :on-click save!})])))
+
+(defn- rename-dialog [d]
+  (let [save! (fn [] (let [v (:value (:dialog @ui-state))]
+                       (close-dialog!)
+                       (when-not (str/blank? v) ((:on-save d) v))))]
+    (dialog-card (:title d)
+                 (field {:id :dialog-field :label (:label d) :value (:value d)
+                         :on-input (fn [v] (swap! ui-state assoc-in [:dialog :value] v)) :on-submit save!
+                         :hint "Only the name shown in Linnet changes. Your files stay as they are."})
+                 [(w/button {:id :cancel :label "Cancel" :kind :secondary :on-click close-dialog!})
+                  (w/button {:id :save :label "Save" :on-click save!})])))
+
+(defn- confirm-dialog [d]
+  (dialog-card (:title d)
+               [:text {:font-size 14 :wrap true} (:message d)]
+               [(w/button {:id :cancel :label "Cancel" :kind :secondary :on-click close-dialog!})
+                (w/button {:id :ok :label (:ok-label d) :kind :danger :on-click (fn [] (close-dialog!) ((:on-ok d)))})]))
+
+(defn- folders-dialog [s]
+  (let [roots (:roots (:lib s))]
+    (dialog-card "Music folders"
+                 [:column {:gap 8}
+                  [:text {:class :muted :font-size 13 :wrap true}
+                   "Linnet shows the songs in these folders and the folders inside them. Removing a folder here doesn't delete anything."]
+                  (if (empty? roots)
+                    [:text {:font-size 14} "No folders yet."]
+                    (for [r roots]
+                      [:row {:key r :gap 10 :align-items :center :padding [8 10] :background :bg :border-radius 8}
+                       (theme/icon :folder 18 "#d4a340")
+                       [:column {:flex-grow 1 :min-width 0}
+                        [:text {:font-size 14 :font-weight :bold :white-space :nowrap} (library/folder-name (:lib s) r)]
+                        [:text {:class :muted :font-size 12 :white-space :nowrap} r]]
+                       (w/icon-button {:id (keyword (str "remove-root-" (hash r))) :icon :x :size 14 :tooltip "Stop showing this folder"
+                                       :on-click (fn [] (swap! lib-atom library/remove-root r))})]))]
+                 [(w/button {:id :rescan :label "Check for new music" :icon :refresh :kind :secondary :on-click (fn [] (close-dialog!) (rescan!))})
+                  [:spacer]
+                  (w/button {:id :add-root :label "Add a folder" :icon :plus :kind :secondary :on-click (fn [] (close-dialog!) (add-folder!))})
+                  (w/button {:id :done :label "Done" :on-click close-dialog!})])))
+
+(defn- dialog [s]
+  (when-let [d (:dialog s)]
+    [:box {:id :overlay :position :absolute :inset [0 0 0 0] :background :overlay
+           :align-items :center :justify-content :center}
+     (case (:kind d)
+       :edit (edit-dialog s d)
+       :rename (rename-dialog d)
+       :confirm (confirm-dialog d)
+       :folders (folders-dialog s)
+       nil)]))
+
+;; ---- the window ----
+
+(defn root-view [s]
+  (let [lib (:lib s)
+        current (player/current-path (:player s))]
+    [:box {:flex-grow 1 :position :relative :background :bg :color :text :font-size 14}
+     [:column {:flex-grow 1 :min-height 0}
+      [:row {:flex-grow 1 :min-height 0 :min-width 0 :overflow :hidden}
+       (ui/memo :nav [lib (:view s) (:scan s)] (fn [] (nav lib (:view s) (:scan s))))
+       [:box {:width 1 :background :line}]
+       [:column {:flex-grow 1 :flex-shrink 1 :flex-basis 0 :min-width 0 :overflow :hidden :background :panel}
+        (top-bar s)
+        [:box {:height 1 :background :line}]
+        (ui/memo :content [lib (select-keys s [:view :search :sort :selected :scroll :folder :expanded :folders-touched? :size]) current
+                           (when (= :now-playing (first (:view s))) (:player s))]
+                 (fn [] (content s)))]
+       (when (:show-list? s)
+         [:row {:flex-shrink 0}
+          [:box {:width 1 :background :line}]
+          (ui/memo :queue [lib (select-keys (:player s) [:queue :order :pos :shuffle?])]
+                   (fn [] (queue-pane s)))])]
+      (play-bar s)]
+     (when-let [m (:message s)]
+       [:box {:position :absolute :inset [:auto 0 108 0] :flex-direction :row :justify-content :center}
+        [:box {:background "#1b2333ee" :padding [10 18] :border-radius 20}
+         [:text {:color "#ffffff" :font-size 14} (:text m)]]])
+     (dialog s)]))
+
+(defn- command! [c]
+  (let [p @ctl]
+    (case c
+      :add-folder (add-folder!)
+      :rescan (rescan!)
+      :folders (open-dialog! {:kind :folders})
+      :edit-info (let [s @ui-state
+                       tracks (view-tracks (:lib s) s)
+                       i (get-in s [:selected (table-key s)])
+                       path (if (and i (< i (count tracks))) (:path (nth tracks i)) (player/current-path (player/state p)))]
+                   (when path (edit-info! path)))
+      :find (when-let [wid @window-id] (ui/focus! wid :search))
+      :view-albums (go! [:albums]) :view-artists (go! [:artists]) :view-songs (go! [:songs])
+      :view-genres (go! [:genres]) :view-folders (go! [:folders]) :view-now (go! [:now-playing])
+      :toggle-list (swap! ui-state update :show-list? not)
+      :back (back!)
+      :play-pause (player/toggle! p)
+      :stop (player/stop! p)
+      :previous (player/previous! p)
+      :next (player/next! p)
+      :shuffle (player/toggle-shuffle! p)
+      :repeat (player/cycle-repeat! p)
+      :volume-up (player/set-volume! p (+ 10 (:volume (player/state p))))
+      :volume-down (player/set-volume! p (- (:volume (player/state p)) 10))
+      :mute (player/toggle-mute! p)
+      nil)))
+
+(def menu-commands
+  [:add-folder :rescan :folders :edit-info :find :view-albums :view-artists :view-songs :view-genres :view-folders
+   :view-now :toggle-list :back :play-pause :stop :previous :next :shuffle :repeat :volume-up :volume-down :mute])
+
+(defn- menus []
+  (vec (concat
+         (when (= :macos (sys/os)) [["Linnet" [["Quit Linnet" :quit "cmd+q"]]]])
+         [["File" (vec (concat [["Add a music folder…" :add-folder "cmd+o"]
+                                ["Check for new music" :rescan "cmd+r"]
+                                ["Music folders…" :folders]]
+                               (when-not (= :macos (sys/os)) [:separator ["Exit" :quit "cmd+q"]])))]
+          ["Edit" [["Cut" :cut "cmd+x"] ["Copy" :copy "cmd+c"] ["Paste" :paste "cmd+v"] ["Select All" :select-all "cmd+a"]
+                   :separator ["Edit song info…" :edit-info "cmd+i"] ["Search" :find "cmd+e"]]]
+          ["View" [["Albums" :view-albums "cmd+1"] ["Artists" :view-artists "cmd+2"] ["Songs" :view-songs "cmd+3"]
+                   ["Genres" :view-genres "cmd+4"] ["Folders" :view-folders "cmd+5"] ["Now Playing" :view-now "cmd+6"]
+                   :separator ["Show or hide the play list" :toggle-list "cmd+l"] ["Back" :back "cmd+["]]]
+          ["Play" [["Play or pause" :play-pause "cmd+p"] ["Stop" :stop "cmd+s"]
+                   ["Previous" :previous "cmd+b"] ["Next" :next "cmd+f"]
+                   :separator ["Shuffle" :shuffle "cmd+h"] ["Repeat" :repeat "cmd+t"]
+                   :separator ["Louder" :volume-up "cmd+up"] ["Quieter" :volume-down "cmd+down"] ["Mute" :mute "cmd+m"]]]])))
+
+(defn- remember-settings! []
+  (let [ps (player/state @ctl) s @ui-state]
+    (store/save-settings! {:volume (:volume ps) :shuffle? (:shuffle? ps) :repeat (:repeat ps)
+                           :show-list? (:show-list? s) :view (top-kind (:view s))})))
+
+(defn- watch-length!
+  "Keep the length libVLC finds while playing, which is exact, over the
+  estimate it made reading the tags."
+  [ps]
+  (let [path (player/current-path ps)
+        len (get-in ps [:status :length-ms])]
+    (when (and path len (pos? len))
+      (let [known (get-in @lib-atom [:tracks path :duration-ms])]
+        (when (or (nil? known) (> (abs (- known len)) 1500))
+          (swap! lib-atom assoc-in [:tracks path :duration-ms] len))))))
+
+(defn start!
+  "Load the library, open the player and the window: the window's id."
+  ([] (start! {}))
+  ([{:keys [scan?] :or {scan? true}}]
+   (let [settings (store/load-settings)]
+     (reset! lib-atom (store/load-library))
+     (reset! started true)
+     (store/autosave! lib-atom store/save-library!)
+     (reset! ctl (player/open! (select-keys settings [:volume :shuffle? :repeat])))
+     (swap! ui-state merge {:lib @lib-atom :player (player/state @ctl)
+                            :view (or (:view settings) [:albums])
+                            :show-list? (get settings :show-list? true)})
+     (add-watch lib-atom ::show (fn [_ _ _ new] (swap! ui-state assoc :lib new)))
+     (add-watch (:state @ctl) ::show (fn [_ _ old new]
+                                       (swap! ui-state assoc :player new)
+                                       (when (not= (:status old) (:status new)) (watch-length! new))))
+     (ui/theme! theme/theme)
+     (ui/menu! (menus))
+     (doseq [c menu-commands] (ui/on-command! c (fn [_] (command! c))))
+     (let [wid (ui/window {:title "Linnet" :icon (theme/asset "linnet.ico") :size [1240 800] :min-size [960 620] :remember [store/app-name :main]
+                           :on-resize (fn [e] (swap! ui-state assoc :size (:size e)))
+                           :on-key (fn [e] (when (= :escape (:key e)) (close-dialog!)))
+                           :on-drop (fn [e] (add-paths! (:paths e)))
+                           :on-close (fn [e]
+                                       (handler-case (remember-settings!) (Error [_] nil))
+                                       (ui/close-window (:window e)))}
+                          #'root-view ui-state)]
+       (reset! window-id wid)
+       (when-let [size (ui/window-size wid)] (swap! ui-state assoc :size size))
+       (when (and scan? (seq (:roots @lib-atom))) (rescan!))
+       wid))))
+
+(defn stop!
+  "Save everything and let go of the player."
+  []
+  ;; (only a library this run loaded: never an empty one over the saved one)
+  (when @started
+    (handler-case (store/save-library! @lib-atom) (Error [_] nil)))
+  (when-let [c @ctl] (player/close! c)))

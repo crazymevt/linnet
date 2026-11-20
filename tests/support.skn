@@ -1,0 +1,11 @@
+;;;; Loaded by every test file first. LINNET_VLC_OPTIONS gives libVLC extra
+;;;; options for the tests, such as "--aout=adummy" on CI machines, which
+;;;; have no sound card.
+
+(ns support
+  (:require [skein.string :as str]
+            [skein.sys :as sys]
+            [skein.vlc :as vlc]))
+
+(when-let [options (not-empty (sys/getenv "LINNET_VLC_OPTIONS"))]
+  (vlc/configure! {:options (vec (remove str/blank? (str/split options #"\s+")))}))

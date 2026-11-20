@@ -1,0 +1,104 @@
+;;;; The look: colours, the widget rules on top of skein.ui's, and icons.
+;;;; Light content, a deep blue play bar, and generous text and rows.
+
+(ns linnet.theme
+  (:require [skein.io :as io]
+            [skein.sys :as sys]
+            [skein.ui :as ui]))
+
+(defn asset
+  "A file in assets/: in a packaged app, from its resources; else from the
+  project folder, where run.sh and the tests run."
+  [name]
+  (io/path (or (sys/app-resources) ".") "assets" name))
+
+(defn logo
+  "The linnet icon at size pixels."
+  [size]
+  [:image {:src (asset "linnet-256.png") :width size :height size :flex-shrink 0}])
+
+(def tokens
+  (merge ui/light-tokens
+         {:text "#1b2333" :bg "#eef1f6" :panel "#ffffff" :line "#dde2ea" :muted "#667085" :hover "#e9eef7"
+          :accent "#1f6fd1" :accent-hover "#185cb0" :accent-pressed "#124a8f" :on-accent "#ffffff"
+          :selected "#d8e6fb" :row-alt "#f8fafc"
+          :nav "#f6f8fb" :nav-selected "#dfeafb"
+          :bar "#16233a" :bar-text "#f2f5fa" :bar-muted "#9fb0c8" :bar-hover "#24385a" :bar-line "#3a4d6d"
+          :overlay "#0f172a73" :danger "#c2410c" :playing "#1f6fd1"}))
+
+(def ^:private rules
+  [[[:box :nav-item :*] {:padding [8 12] :border-radius 8 :cursor :pointer :transition [:background 100]}]
+   [[:box :nav-item :hover] {:background :hover}]
+   [[:box :nav-item :selected] {:background :nav-selected :color :accent}]
+   [[:text :nav-heading :*] {:color :muted :font-size 12 :font-weight :bold}]
+   [[:box :track-row :*] {:cursor :default}]
+   [[:box :track-row :hover] {:background :hover}]
+   [[:box :track-row :selected] {:background :selected}]
+   [[:box :table-header :*] {:background :panel :border [0 :line]}]
+   [[:box :header-cell :*] {:padding [0 10] :cursor :pointer}]
+   [[:box :header-cell :hover] {:background :hover}]
+   [[:box :tile :*] {:padding 8 :border-radius 10 :cursor :pointer :transition [:background 100]}]
+   [[:box :tile :hover] {:background :hover}]
+   [[:box :icon-button :*] {:padding 7 :border-radius 8 :cursor :pointer :transition [:background 100]}]
+   [[:box :icon-button :hover] {:background :hover}]
+   [[:box :transport :*] {:padding 8 :border-radius 20 :cursor :pointer :transition [:background 100]}]
+   [[:box :transport :hover] {:background :bar-hover}]
+   [[:box :big-play :*] {:width 52 :height 52 :border-radius 26 :background :bar-text :cursor :pointer
+                         :align-items :center :justify-content :center :transition [:background 100]}]
+   [[:box :big-play :hover] {:background "#ffffff"}]
+   [[:button :secondary :*] {:background :hover :color :text}]
+   [[:button :secondary :hover] {:background :line}]
+   [[:button :secondary :pressed] {:background :line}]
+   [[:button :danger :*] {:background :danger :color :on-accent}]
+   [[:button :danger :hover] {:background "#9a3412"}]
+   [[:box :dialog :*] {:background :panel :border-radius 14 :padding 24}]
+   [[:box :queue-row :*] {:padding [6 10] :border-radius 8 :cursor :pointer}]
+   [[:box :queue-row :hover] {:background :hover}]
+   [[:box :queue-row :selected] {:background :nav-selected}]
+   [[:box :link :*] {:cursor :pointer}]
+   [[:text-field :search :*] {:border-radius 18 :padding [7 14] :background :panel}]])
+
+(def theme {:tokens tokens :rules (into (:rules ui/base-theme) rules)})
+
+;; Icons in a 24 by 24 box. Stroked unless named in filled.
+(def icons
+  {:note "M9 18V5l12-2v13 M9 18a3 3 0 1 1-6 0a3 3 0 0 1 6 0z M21 16a3 3 0 1 1-6 0a3 3 0 0 1 6 0z"
+   :person "M12 12a4 4 0 1 0 0-8a4 4 0 0 0 0 8z M4 21c0-4 3.6-6 8-6s8 2 8 6"
+   :disc "M12 3a9 9 0 1 0 0 18a9 9 0 1 0 0-18z M12 9.5a2.5 2.5 0 1 0 0 5a2.5 2.5 0 1 0 0-5z"
+   :tag "M3 12V4a1 1 0 0 1 1-1h8l9 9-9 9z M7.5 7.5h.01"
+   :folder (:folder ui/icons)
+   :playlist "M3 6h12 M3 12h12 M3 18h8 M17 18V8l4-1"
+   :now-playing "M4 18V9 M9 18V5 M14 18v-6 M19 18V8"
+   :search (:search ui/icons)
+   :plus (:plus ui/icons)
+   :pencil "M4 20h4L19 9l-4-4L4 16z M13.5 6.5l4 4"
+   :back "M15 6l-6 6 6 6"
+   :x (:x ui/icons)
+   :refresh (:refresh ui/icons)
+   :play "M8 5.5v13a1 1 0 0 0 1.5.9l10.4-6.5a1 1 0 0 0 0-1.8L9.5 4.6A1 1 0 0 0 8 5.5z"
+   :pause "M7 5h3.5v14H7z M13.5 5H17v14h-3.5z"
+   :previous "M6 5h2.5v14H6z M19 5.8v12.4a.8.8 0 0 1-1.2.7L9.5 12.6a.8.8 0 0 1 0-1.2l8.3-6.3a.8.8 0 0 1 1.2.7z"
+   :next "M15.5 5H18v14h-2.5z M5 5.8v12.4a.8.8 0 0 0 1.2.7l8.3-6.3a.8.8 0 0 0 0-1.2L6.2 5.1A.8.8 0 0 0 5 5.8z"
+   :shuffle "M3 7h3c4 0 6 10 10 10h5 M3 17h3c1.6 0 2.8-1.6 3.9-3.6 M14.1 9.6C15.2 7.6 16.4 7 18 7h3 M18 4l3 3-3 3 M18 14l3 3-3 3"
+   :repeat "M17 2l3 3-3 3 M4 11V9a4 4 0 0 1 4-4h12 M7 22l-3-3 3-3 M20 13v2a4 4 0 0 1-4 4H4"
+   :volume "M4 9h4l5-4v14l-5-4H4z M16 9a4 4 0 0 1 0 6 M18.5 6.5a8 8 0 0 1 0 11"
+   :muted "M4 9h4l5-4v14l-5-4H4z M17 9.5l5 5 M22 9.5l-5 5"
+   :list (:list ui/icons)
+   :music-folder "M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z M14 15.5V10l3-.6 M14 15.5a1.5 1.5 0 1 1-3 0a1.5 1.5 0 0 1 3 0z"})
+
+(def ^:private filled #{:play :pause :previous :next})
+
+(defn icon
+  "An icon element: name from icons, size in pixels, colour a token or #rrggbb."
+  ([name] (icon name 18 :text))
+  ([name size color]
+   (if (filled name)
+     [:icon {:d (get icons name) :fill true :size size :color color}]
+     [:icon {:d (get icons name) :size size :color color}])))
+
+(def cover-colours
+  "Backgrounds for albums with no cover picture."
+  ["#3b6fb6" "#5b8c51" "#b0603a" "#7d5ba6" "#2f8f8f" "#a04a6a" "#8a7a35" "#4a5f8a"])
+
+(defn cover-colour [s]
+  (nth cover-colours (mod (reduce (fn [h c] (mod (+ (* 31 h) (int c)) 1000003)) 7 (str s)) (count cover-colours))))

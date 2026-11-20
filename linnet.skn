@@ -1,0 +1,4 @@
+(require '[linnet.main :as linnet])
+(require '[skein.sys :as sys])
+
+(apply linnet/main (drop 2 (sys/args)))

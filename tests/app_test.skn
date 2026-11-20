@@ -1,0 +1,129 @@
+;;;; The player's window, headless: clicking through the views, playing,
+;;;; editing, renaming and playlists. LINNET_SHOTS=dir saves screenshots.
+
+(ns app-test
+  (:require [support]
+            [skein.io :as io]
+            [skein.sys :as sys]
+            [skein.test :refer [deftest is testing]]
+            [skein.ui :as ui]
+            [linnet.app :as app]
+            [linnet.library :as library]
+            [linnet.player :as player]
+            [linnet.scan :as scan]
+            [linnet.store :as store]))
+
+(def tmp (io/path (io/temp-directory) (str "linnet-app-test-" (nano-time))))
+(store/set-data-dir! (io/path tmp "data"))
+(ui/set-state-dir! (io/path tmp "ui"))
+
+(def root (io/canonical "tests/fixtures/music"))
+
+(defn- settle [] (ui/settle!) (sleep 120))
+(defn- wait-for [ms f]
+  (loop [t 0] (let [v (f)] (if (or v (>= t ms)) v (do (sleep 50) (recur (+ t 50)))))))
+(defn- shot [wid file]
+  (when-let [dir (not-empty (sys/getenv "LINNET_SHOTS"))]
+    (io/mkdirs! dir)
+    (ui/screenshot wid (io/path dir file) 1)))
+
+(defn- click! [wid id] (ui/click! wid id) (settle))
+
+(defn- double-click! [wid id]
+  (let [{:keys [x y w h]} (ui/node-rect wid (ui/node-of wid id))]
+    (ui/simulate! [:click wid (+ x (/ w 2)) (+ y (/ h 2)) nil 2])
+    (settle)))
+
+(defn- there? [wid id] (some? (ui/node-of wid id)))
+(defn- view [] (:view @app/ui-state))
+(defn- now-path [] (player/current-path (player/state @app/ctl)))
+
+(deftest the-player-window
+  (let [wid (app/start! {:scan? false})]
+    (try
+      (settle)
+      (testing "an empty library welcomes"
+        (is (there? wid :welcome-add))
+        (shot wid "welcome.png"))
+      (scan/add-folder! app/lib-atom root (fn [_]))
+      (settle)
+      (testing "the navigation pane"
+        (click! wid :nav-songs)
+        (is (= [:songs] (view)))
+        (is (there? wid :songs-table-row-9))
+        (click! wid :nav-folders)
+        (is (= [:folders] (view)))
+        (is (there? wid :folder-tree))
+        (click! wid :nav-albums)
+        (is (= [:albums] (view)))
+        (click! wid :album-0)
+        (is (= [:album ["Marigold Strings" "Dawn Suite"]] (view)))
+        (click! wid :back)
+        (is (= [:albums] (view)) "Back"))
+      (testing "playing"
+        (click! wid :nav-songs)
+        (double-click! wid :songs-table-row-0)
+        (let [first-song (:path (first (library/sort-tracks (library/tracks @app/lib-atom) [:artist :asc])))]
+          (is (= first-song (now-path)) "a double click plays the song")
+          (is (= 10 (count (:queue (player/state @app/ctl)))) "and queues the list it's in")
+          (is (= :playing (wait-for 3000 #(#{:playing} (get-in (player/state @app/ctl) [:status :state]))))))
+        (click! wid :play-pause)
+        (is (= :paused (wait-for 3000 #(#{:paused} (get-in (player/state @app/ctl) [:status :state])))))
+        (click! wid :next)
+        (is (= 1 (player/current-index (player/state @app/ctl))))
+        (shot wid "songs.png"))
+      (testing "editing a song's info leaves the file alone"
+        (let [path (now-path)
+              before (io/read-bytes path)]
+          (app/edit-info! path)
+          (settle)
+          (is (there? wid :dialog-field))
+          (shot wid "edit.png")
+          (swap! app/ui-state assoc-in [:dialog :values :title] "Ivy Waltz (live)")
+          (click! wid :save)
+          (is (nil? (:dialog @app/ui-state)))
+          (is (= "Ivy Waltz (live)" (:title (library/track @app/lib-atom path))))
+          (is (= before (io/read-bytes path)))))
+      (testing "renaming a folder"
+        (click! wid :nav-folders)
+        (swap! app/ui-state assoc :folder (io/path root "Favourites"))
+        (settle)
+        (click! wid :rename-folder)
+        (is (= :rename (get-in @app/ui-state [:dialog :kind])))
+        (swap! app/ui-state assoc-in [:dialog :value] "Mom's Favourites")
+        (click! wid :save)
+        (is (= "Mom's Favourites" (library/folder-name @app/lib-atom (io/path root "Favourites"))))
+        (is (io/directory? (io/path root "Favourites")) "the folder on disk is unchanged")
+        (shot wid "folders.png"))
+      (testing "searching"
+        (swap! app/ui-state assoc :search "waltz")
+        (settle)
+        (is (there? wid :play-results))
+        (swap! app/ui-state assoc :search "")
+        (settle))
+      (testing "a playlist"
+        (click! wid :new-playlist)
+        (swap! app/ui-state assoc-in [:dialog :value] "Sunday songs")
+        (click! wid :save)
+        (let [p (first (:playlists @app/lib-atom))]
+          (is (= "Sunday songs" (:name p)))
+          (is (there? wid (keyword (str "nav-" (:id p)))))))
+      (testing "Escape closes a dialog"
+        (app/edit-info! (now-path))
+        (settle)
+        (ui/simulate! [:key wid :escape])
+        (settle)
+        (is (nil? (:dialog @app/ui-state))))
+      (testing "removing a song asks first, and keeps the file"
+        (click! wid :nav-songs)
+        (let [tracks (library/sort-tracks (library/tracks @app/lib-atom) [:artist :asc])
+              path (:path (last tracks))]
+          (#'app/track-command! [:songs] tracks (dec (count tracks)) :hide)
+          (settle)
+          (is (= :confirm (get-in @app/ui-state [:dialog :kind])))
+          (click! wid :ok)
+          (is (contains? (:hidden @app/lib-atom) path))
+          (is (io/file? path))))
+      (finally
+        (app/stop!)
+        (ui/close-window wid)))))

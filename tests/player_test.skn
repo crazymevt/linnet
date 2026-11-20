@@ -1,0 +1,69 @@
+(ns player-test
+  (:require [support]
+            [skein.io :as io]
+            [skein.test :refer [deftest is testing]]
+            [linnet.player :as player]))
+
+(def root (io/canonical "tests/fixtures/music"))
+(def songs
+  (mapv (fn [f] (io/path root "Country" "Hearthside Band - Front Porch" f))
+        ["01 Front Porch.mp3" "02 Long Road Home.mp3" "03 Sweet Tea.mp3"]))
+(def a (nth songs 0))
+(def b (nth songs 1))
+(def c (nth songs 2))
+
+(defn- wait-for [ms f]
+  (loop [t 0] (let [v (f)] (if (or v (>= t ms)) v (do (sleep 50) (recur (+ t 50)))))))
+
+(defn- now [ctl] (player/current-path (player/state ctl)))
+(defn- playing [ctl] (get-in (player/state ctl) [:status :state]))
+
+(deftest a-queue
+  (let [ctl (player/open! {:volume 30})]
+    (try
+      (player/play-queue! ctl songs 1)
+      (is (= b (now ctl)))
+      (is (= :playing (wait-for 3000 #(#{:playing} (playing ctl)))))
+      (player/next! ctl)
+      (is (= c (now ctl)))
+      (player/next! ctl)
+      (is (= a (now ctl)) "Next at the end wraps around")
+      (player/previous! ctl)
+      (is (= a (now ctl)) "Previous at the first song restarts it")
+      (testing "the queue changes around the current song"
+        (player/play-next! ctl [c])
+        (is (= [a c b c] (:queue (player/state ctl))))
+        (player/next! ctl)
+        (is (= c (now ctl)))
+        (player/remove-from-queue! ctl 0)
+        (is (= [c b c] (:queue (player/state ctl))))
+        (is (= c (now ctl)) "still the same song")
+        (player/move-in-queue! ctl 0 2)
+        (is (= [b c c] (:queue (player/state ctl))))
+        (is (= 2 (player/current-index (player/state ctl))) "it moved with its song")
+        (player/enqueue! ctl [a])
+        (is (= [b c c a] (:queue (player/state ctl)))))
+      (testing "shuffle keeps the current song"
+        (player/toggle-shuffle! ctl)
+        (is (:shuffle? (player/state ctl)))
+        (is (= 2 (player/current-index (player/state ctl))))
+        (is (= (set (range 4)) (set (:order (player/state ctl)))))
+        (player/toggle-shuffle! ctl)
+        (is (= [0 1 2 3] (:order (player/state ctl)))))
+      (testing "repeat"
+        (is (= :all (:repeat (player/cycle-repeat! ctl))))
+        (is (= :one (:repeat (player/cycle-repeat! ctl))))
+        (is (= :off (:repeat (player/cycle-repeat! ctl)))))
+      (testing "a song that ends moves on, and the list stops at its end"
+        (player/play-queue! ctl [b c] 0)
+        (is (= c (wait-for 6000 #(when (= c (now ctl)) c))) "on to the next song")
+        (is (= :ended (wait-for 6000 #(#{:ended} (playing ctl)))) "then stops")
+        (is (= c (now ctl))))
+      (testing "a missing file is skipped"
+        (player/play-queue! ctl [(io/path root "nope.mp3") a] 0)
+        (is (= a (now ctl))))
+      (player/set-volume! ctl 55)
+      (is (= 55 (:volume (player/state ctl))))
+      (player/clear-queue! ctl)
+      (is (nil? (now ctl)))
+      (finally (player/close! ctl)))))

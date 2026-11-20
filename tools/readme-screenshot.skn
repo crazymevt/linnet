@@ -1,0 +1,51 @@
+;;;; The README's screenshot: an album open while one of its songs plays,
+;;;; from the fixture library, headless, at twice the size for sharp
+;;;; displays. The fixture songs are two seconds of silence, so this script
+;;;; gives them the lengths of real songs, in its throwaway library only,
+;;;; and shows the player partway into one. Run from the project folder:
+;;;;   SKEIN_UI_HEADLESS=1 ../skein-lang/target/release/skein tools/readme-screenshot.skn
+
+(require '[skein.io :as io] '[skein.sys :as sys] '[skein.ui :as ui]
+         '[linnet.app :as app] '[linnet.library :as library] '[linnet.player :as player]
+         '[linnet.scan :as scan] '[linnet.store :as store] '[linnet.theme :as theme])
+
+(def out "docs/screenshot.png")
+(def tmp (io/path (io/temp-directory) (str "linnet-readme-" (nano-time))))
+(store/set-data-dir! tmp)
+(ui/set-state-dir! (io/path tmp "ui"))
+(ui/theme! theme/theme)
+
+(def wid (app/start! {:scan? false}))
+(scan/add-folder! app/lib-atom (io/canonical "tests/fixtures/music") (fn [_]))
+
+;; Lengths like real songs'.
+(def lengths
+  {"Morning Light" 247000 "River Song" 212000 "Evening Hymn" 289000 "Rose Waltz" 184000 "Ivy Waltz" 201000
+   "Front Porch" 196000 "Long Road Home" 233000 "Sweet Tea" 178000 "Sunday Morning" 265000 "Grandpa's Tune" 142000})
+(swap! app/lib-atom
+       (fn [l] (reduce (fn [l t] (assoc-in l [:tracks (:path t) :duration-ms] (get lengths (:title t) 200000)))
+                       l (library/tracks l))))
+
+;; A playlist in the sidebar, so it doesn't look empty.
+(let [l @app/lib-atom
+      [l id] (library/new-playlist l "Sunday afternoon")
+      [l _] (library/new-playlist l "Mom's favourites")]
+  (reset! app/lib-atom (library/add-to-playlist l id (take 4 (map :path (library/tracks l))))))
+
+;; Play the album from its second song, and show it 1:24 in. (The watcher
+;; would set the real, two-second file's place back: stop it first.)
+(let [album (some (fn [a] (when (= "Dawn Suite" (:name a)) a)) (library/albums (library/tracks @app/lib-atom)))]
+  (player/play-queue! @app/ctl (mapv :path (:tracks album)) 1)
+  (app/go! [:album (:key album)])
+  (sleep 300)
+  (reset! (:watcher @app/ctl) false)
+  (sleep 200)
+  (swap! (:state @app/ctl) assoc :status {:state :playing :time-ms 84000 :length-ms 212000})
+  (swap! app/ui-state assoc-in [:selected [:album (:key album)]] 1))
+
+(ui/settle!)
+(sleep 400)
+(io/mkdirs! (io/parent out))
+(println (ui/screenshot wid out 2))
+(app/stop!)
+(sys/exit 0)

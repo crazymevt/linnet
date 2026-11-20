@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <title>Linnet (small)</title>
+  <!-- linnet.svg simplified for 16 to 32 pixels: the bird enlarged to fill
+       the tile, a plain branch, and no note, leaves or wing flashes. -->
+  <defs>
+    <linearGradient id="sky" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#4f8fe8"/>
+      <stop offset="1" stop-color="#1b4f9e"/>
+    </linearGradient>
+    <clipPath id="body-clip">
+      <ellipse cx="520" cy="590" rx="215" ry="150" transform="rotate(-30 520 590)"/>
+    </clipPath>
+  </defs>
+  <rect x="0" y="0" width="1024" height="1024" rx="180" fill="url(#sky)"/>
+  <rect x="40" y="840" width="944" height="70" rx="35" fill="#6b4228"/>
+  <g transform="translate(-300 -330) scale(1.5)">
+    <path d="M370 680 L 250 850 L 300 830 L 300 890 L 420 720 Z" fill="#2e211b"/>
+    <ellipse cx="520" cy="590" rx="215" ry="150" transform="rotate(-30 520 590)" fill="#a35e35"/>
+    <g clip-path="url(#body-clip)">
+      <ellipse cx="590" cy="700" rx="200" ry="120" transform="rotate(-30 590 700)" fill="#f4e9da"/>
+      <ellipse cx="660" cy="560" rx="100" ry="105" fill="#e23a4e"/>
+    </g>
+    <path d="M600 480 C 540 470, 440 520, 360 690 C 470 650, 570 590, 610 520 Z" fill="#3d2922"/>
+    <circle cx="680" cy="420" r="108" fill="#9aa0a8"/>
+    <path d="M700 318 C 742 316, 778 336, 790 372 C 760 360, 730 356, 706 364 Z" fill="#e23a4e"/>
+    <path d="M780 396 L 852 410 L 780 432 Z" fill="#454950"/>
+    <circle cx="728" cy="404" r="24" fill="#111114"/>
+  </g>
+</svg>

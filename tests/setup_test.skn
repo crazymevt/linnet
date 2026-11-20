@@ -1,0 +1,96 @@
+;;;; Fetching VLC when it's missing, from a local server serving a small
+;;;; zip laid out like VideoLAN's.
+
+(ns setup-test
+  (:require [support]
+            [skein.crypto :as crypto]
+            [skein.http :as http]
+            [skein.io :as io]
+            [skein.sys :as sys]
+            [skein.test :refer [deftest is testing]]
+            [skein.ui :as ui]
+            [skein.zip :as zip]
+            [linnet.setup :as setup]
+            [linnet.store :as store]))
+
+(def tmp (io/path (io/temp-directory) (str "linnet-setup-test-" (nano-time))))
+(store/set-data-dir! tmp)
+(ui/set-state-dir! (io/path tmp "ui"))
+
+(def fake-vlc
+  (zip/zip {"vlc-9.9.9/" ""
+            "vlc-9.9.9/libvlc.dll" "the library"
+            "vlc-9.9.9/libvlccore.dll" "the core"
+            "vlc-9.9.9/vlc.exe" "the program"
+            "vlc-9.9.9/plugins/audio_output/libmmdevice_plugin.dll" "sound"
+            "vlc-9.9.9/plugins/codec/libmpg123_plugin.dll" "mp3"
+            "vlc-9.9.9/plugins/gui/libqt_plugin.dll" "the window"
+            "vlc-9.9.9/plugins/plugins.dat" "a cache"}))
+
+(def served (atom 0))
+
+(def server
+  (http/serve (fn [req]
+                (swap! served inc)
+                (case (:path req)
+                  "/vlc.zip" {:status 200 :headers {"content-type" "application/zip"} :body fake-vlc}
+                  {:status 404 :body "no"}))))
+
+(defn- release [overrides]
+  (merge {:url (str "http://127.0.0.1:" (:port server) "/vlc.zip")
+          :sha256 (crypto/hex (crypto/sha256 fake-vlc))
+          :size (count fake-vlc)}
+         overrides))
+
+(defn- rel [p] (io/to-slash (io/relative-to p (setup/vlc-dir))))
+
+(deftest installing-vlc
+  (let [stages (atom [])
+        lib (setup/install! (release {}) (fn [p] (swap! stages conj (:stage p))))
+        files (set (map rel (filter io/file? (skein.fs/walk (setup/vlc-dir)))))]
+    (is (= (io/path (setup/vlc-dir) "libvlc.dll") lib))
+    (is (= #{"libvlc.dll" "libvlccore.dll" "plugins/audio_output/libmmdevice_plugin.dll" "plugins/codec/libmpg123_plugin.dll"}
+           files)
+        "only what playing needs: no vlc.exe, no VLC window, no stale plugin cache")
+    (is (= "the library" (io/read-text lib)))
+    (is (= [:downloading :checking :unpacking] (distinct @stages)))
+    (is (not (io/exists? (io/path tmp "downloads" "vlc.zip"))) "the zip is deleted afterwards")
+    (is (not (io/exists? (str (setup/vlc-dir) ".new"))))))
+
+(deftest a-damaged-download
+  (setup/install! (release {}) (fn [_]))
+  (let [before (io/read-text (io/path (setup/vlc-dir) "libvlc.dll"))]
+    (is (thrown? Error (setup/install! (release {:sha256 (apply str (repeat 64 "0"))}) (fn [_]))))
+    (is (not (io/exists? (io/path tmp "downloads" "vlc.zip"))) "a damaged download isn't kept")
+    (is (= before (io/read-text (io/path (setup/vlc-dir) "libvlc.dll"))) "the working copy stays"))
+  (is (thrown? Error (setup/install! (release {:url (str "http://127.0.0.1:" (:port server) "/missing.zip")}) (fn [_]))))
+  (let [not-vlc (zip/zip {"readme.txt" "hello"})]
+    (is (thrown? Error (#'setup/unpack! not-vlc (io/path tmp "elsewhere") (fn [_ _]))) "a zip without VLC's libraries")))
+
+(deftest the-pinned-releases
+  (testing "the build follows this process's architecture"
+    (is (re-find #"/win64/vlc-3\.0\.\d+-win64\.zip$" (:url (setup/release-for :windows :x86_64))))
+    (is (re-find #"/winarm64/vlc-3\.0\.\d+-winarm64\.zip$" (:url (setup/release-for :windows :aarch64))))
+    (is (nil? (setup/release-for :windows :x86)) "no 32-bit Skein")
+    (is (nil? (setup/release-for :macos :aarch64)) "macOS installs VLC itself")
+    (is (nil? (setup/release-for :linux :x86_64))))
+  (doseq [[arch r] setup/vlc-releases]
+    (is (re-matches #"https://download\.videolan\.org/pub/videolan/vlc/.*\.zip" (:url r)) (name arch))
+    (is (re-matches #"[0-9a-f]{64}" (:sha256 r)) (name arch))
+    (is (pos? (:size r)) (name arch))))
+
+(deftest any-top-folder
+  (let [flat (zip/zip {"libvlc.dll" "flat" "libvlccore.dll" "core" "plugins/codec/a.dll" "a"})]
+    (#'setup/unpack! flat (io/path tmp "flat") (fn [_ _]))
+    (is (= "flat" (io/read-text (io/path tmp "flat" "libvlc.dll"))) "a zip without a top folder")
+    (is (io/file? (io/path tmp "flat" "plugins" "codec" "a.dll")))))
+
+(deftest the-setup-window
+  (let [ready (atom false)
+        wid (setup/show! (release {}) (fn [] (reset! ready true)))]
+    (ui/settle!)
+    (is (some? (ui/node-of wid (if (setup/can-download?) :download :retry))))
+    (when-let [dir (not-empty (sys/getenv "LINNET_SHOTS"))]
+      (ui/screenshot wid (io/path dir "setup.png") 1))
+    (is (false? @ready))
+    (ui/close-window wid)))

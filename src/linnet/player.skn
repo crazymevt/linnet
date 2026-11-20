@@ -1,0 +1,261 @@
+;;;; What's playing: the play queue (Windows Media Player's "list"), the
+;;;; song in it that's current, shuffle and repeat, and one skein.vlc
+;;;; player. A watcher fiber polls the player a few times a second, keeps a
+;;;; snapshot for the screen and moves to the next song when one ends.
+;;;;
+;;;; The state atom holds:
+;;;;   :queue    the song paths, in the order they were queued
+;;;;   :order    the order to play them in: queue positions (shuffled or not)
+;;;;   :pos      where in :order playing is, or nil before anything plays
+;;;;   :shuffle? :repeat (:off, :all or :one) :volume (0..100) :muted?
+;;;;   :status   the player's last {:state :time-ms :length-ms}
+
+(ns linnet.player
+  (:require [skein.vlc :as vlc]))
+
+(defclass Controller () ((vlc) (state) (watcher)))
+
+(defn- straight [n] (vec (range n)))
+
+(defn- shuffled
+  "Every queue position in random order, with first (when given) first."
+  [n first]
+  (let [rest (shuffle (vec (remove #{first} (range n))))]
+    (if first (vec (cons first rest)) rest)))
+
+(defn current-index
+  "The queue position of the current song, or nil."
+  [{:keys [order pos]}]
+  (when (and pos (< -1 pos (count order))) (nth order pos)))
+
+(defn current-path [s] (when-let [i (current-index s)] (get (:queue s) i)))
+
+(defn state [ctl] @(:state ctl))
+
+;; ---- playing ----
+
+(defn- start!
+  "Play the song at :pos. A song that can't be played (a file since
+  deleted, say) is skipped, up to the queue's length."
+  [ctl tries]
+  (let [s @(:state ctl)
+        path (current-path s)]
+    (when path
+      (let [ok (try (vlc/play! (:vlc ctl) path) true (catch Error _ false))]
+        (if ok
+          (swap! (:state ctl) assoc :status {:state :opening :time-ms 0 :length-ms nil} :failures 0)
+          (let [n (count (:queue s))]
+            (if (and (< tries n) (< (inc (:pos s)) (count (:order s))))
+              (do (swap! (:state ctl) update :pos inc) (start! ctl (inc tries)))
+              (swap! (:state ctl) assoc :status {:state :error :time-ms 0 :length-ms nil}))))))))
+
+(defn play-queue!
+  "Replace the queue with paths and play from position start (0 by default)."
+  ([ctl paths] (play-queue! ctl paths 0))
+  ([ctl paths start]
+   (let [paths (vec paths) n (count paths)
+         start (if (< -1 start n) start 0)]
+     (when (pos? n)
+       ;; (shuffled, start plays first and the rest follow in random order;
+       ;; else the whole queue is in order and playing begins at start)
+       (swap! (:state ctl)
+              (fn [s] (if (:shuffle? s)
+                        (assoc s :queue paths :order (shuffled n start) :pos 0)
+                        (assoc s :queue paths :order (straight n) :pos start))))
+       (start! ctl 0)))))
+
+(defn play-at!
+  "Play the song at queue position i."
+  [ctl i]
+  (let [s @(:state ctl)]
+    (when (< -1 i (count (:queue s)))
+      (swap! (:state ctl) assoc :pos (or (first (keep-indexed (fn [p q] (when (= q i) p)) (:order s))) 0))
+      (start! ctl 0))))
+
+(defn- playing-state [ctl] (get-in @(:state ctl) [:status :state]))
+
+(defn toggle!
+  "Pause or resume. With nothing loaded, play the queue from the start."
+  [ctl]
+  (let [s @(:state ctl)]
+    (cond
+      (empty? (:queue s)) nil
+      (or (nil? (:pos s)) (#{:ended :stopped :error :idle} (playing-state ctl)))
+      (do (when (nil? (:pos s)) (swap! (:state ctl) assoc :pos 0)) (start! ctl 0))
+      :else (vlc/toggle-pause! (:vlc ctl)))))
+
+(defn stop!
+  [ctl]
+  (vlc/stop! (:vlc ctl))
+  (swap! (:state ctl) assoc-in [:status :state] :stopped))
+
+(defn next!
+  "Go to the next song. At the end of the queue, wrap around when repeat is
+  :all (or when the listener pressed Next), else stop."
+  ([ctl] (next! ctl true))
+  ([ctl pressed?]
+   (let [{:keys [order pos repeat]} @(:state ctl)
+         n (count order)]
+     (cond
+       (zero? n) nil
+       (and pos (< (inc pos) n)) (do (swap! (:state ctl) assoc :pos (inc pos)) (start! ctl 0))
+       (or pressed? (= repeat :all)) (do (swap! (:state ctl) assoc :pos 0) (start! ctl 0))
+       :else (swap! (:state ctl) assoc-in [:status :state] :ended)))))
+
+(defn previous!
+  "Go back to the start of this song, or to the previous one when this one
+  has only just begun."
+  [ctl]
+  (let [{:keys [pos status]} @(:state ctl)]
+    (cond
+      (nil? pos) nil
+      (and (> (or (:time-ms status) 0) 3000) (#{:playing :paused} (:state status)))
+      (vlc/seek! (:vlc ctl) 0)
+      (pos? pos) (do (swap! (:state ctl) update :pos dec) (start! ctl 0))
+      :else (start! ctl 0))))
+
+(defn seek!
+  [ctl ms]
+  (vlc/seek! (:vlc ctl) (max 0 (int ms)))
+  (swap! (:state ctl) assoc-in [:status :time-ms] (max 0 (int ms))))
+
+(defn set-volume! [ctl v]
+  (let [v (max 0 (min 100 (int v)))]
+    (swap! (:state ctl) assoc :volume v :muted? false)
+    (try (vlc/set-volume! (:vlc ctl) v) (vlc/set-muted! (:vlc ctl) false) (catch Error _ nil))))
+
+(defn toggle-mute! [ctl]
+  (let [m (not (:muted? @(:state ctl)))]
+    (swap! (:state ctl) assoc :muted? m)
+    (vlc/set-muted! (:vlc ctl) m)))
+
+(defn toggle-shuffle!
+  "Shuffle the songs still to come, or go back to queue order, keeping the
+  current song."
+  [ctl]
+  (swap! (:state ctl)
+         (fn [s]
+           (let [n (count (:queue s)) cur (current-index s) on (not (:shuffle? s))]
+             (assoc s :shuffle? on
+                    :order (if on (shuffled n cur) (straight n))
+                    :pos (when cur (if on 0 cur)))))))
+
+(defn cycle-repeat!
+  "Off, then repeat the whole list, then repeat this song."
+  [ctl]
+  (swap! (:state ctl) update :repeat {:off :all :all :one :one :off}))
+
+;; ---- changing the queue ----
+
+(defn- rebuild-order
+  "s with the queue set to queue, keeping the current song (now at queue
+  position cur) current."
+  [s queue cur]
+  (let [n (count queue)]
+    (assoc s :queue queue
+           :order (if (:shuffle? s) (shuffled n cur) (straight n))
+           :pos (when cur (if (:shuffle? s) 0 cur)))))
+
+(defn enqueue!
+  "Add paths to the end of the queue."
+  [ctl paths]
+  (swap! (:state ctl)
+         (fn [s] (let [q (into (:queue s) paths)
+                       n0 (count (:queue s))]
+                   (if (:shuffle? s)
+                     (assoc s :queue q :order (into (:order s) (shuffle (vec (range n0 (count q))))))
+                     (assoc s :queue q :order (straight (count q))))))))
+
+(defn play-next!
+  "Put paths right after the current song."
+  [ctl paths]
+  (swap! (:state ctl)
+         (fn [s]
+           (let [cur (current-index s)
+                 at (if cur (inc cur) 0)
+                 q (vec (concat (subvec (:queue s) 0 at) paths (subvec (:queue s) at)))]
+             (if (:shuffle? s)
+               ;; (next in the shuffled order too)
+               (let [shift (fn [i] (if (>= i at) (+ i (count paths)) i))
+                     order (mapv shift (:order s))
+                     p (or (:pos s) -1)]
+                 (assoc s :queue q
+                        :order (vec (concat (subvec order 0 (inc p)) (range at (+ at (count paths))) (subvec order (inc p))))))
+               (assoc s :queue q :order (straight (count q))))))))
+
+(defn remove-from-queue!
+  "Take the song at queue position i out of the queue. Removing the current
+  song moves on to the next one."
+  [ctl i]
+  (let [s @(:state ctl)
+        cur (current-index s)]
+    (when (< -1 i (count (:queue s)))
+      (let [q (vec (concat (subvec (:queue s) 0 i) (subvec (:queue s) (inc i))))
+            playing? (= i cur)
+            new-cur (cond (nil? cur) nil (< i cur) (dec cur) playing? (when (< i (count q)) i) :else cur)]
+        (swap! (:state ctl) rebuild-order q new-cur)
+        (when playing?
+          (if new-cur (start! ctl 0) (do (vlc/stop! (:vlc ctl)) (swap! (:state ctl) assoc :pos nil :status {:state :stopped}))))))))
+
+(defn move-in-queue!
+  "Move the song at queue position from to position to."
+  [ctl from to]
+  (let [s @(:state ctl) n (count (:queue s)) cur (current-index s)]
+    (when (and (< -1 from n) (< -1 to n) (not= from to))
+      (let [x (nth (:queue s) from)
+            without (vec (concat (subvec (:queue s) 0 from) (subvec (:queue s) (inc from))))
+            q (vec (concat (subvec without 0 to) [x] (subvec without to)))
+            follow (fn [i] (cond (nil? i) nil (= i from) to
+                                 (and (< from i) (<= i to)) (dec i)
+                                 (and (<= to i) (< i from)) (inc i)
+                                 :else i))]
+        (swap! (:state ctl) rebuild-order q (follow cur))))))
+
+(defn clear-queue! [ctl]
+  (vlc/stop! (:vlc ctl))
+  (swap! (:state ctl) assoc :queue [] :order [] :pos nil :status {:state :idle}))
+
+;; ---- watching the player ----
+
+(defn- poll!
+  "Refresh the snapshot, and move on when a song has ended. The snapshot
+  changes (and the screen redraws) only when something shown changes."
+  [ctl]
+  (let [st (vlc/status (:vlc ctl))
+        snap {:state (:state st) :time-ms (or (:time-ms st) 0) :length-ms (:length-ms st)}
+        old (:status @(:state ctl))]
+    (when (and (= :ended (:state st)) (not= :ended (:state old)))
+      (if (= :one (:repeat @(:state ctl)))
+        (start! ctl 0)
+        (next! ctl false)))
+    (when (and (not= :ended (:state st))
+               (or (not= (:state snap) (:state old))
+                   (not= (:length-ms snap) (:length-ms old))
+                   (not= (quot (:time-ms snap) 250) (quot (or (:time-ms old) 0) 250))))
+      ;; (while opening, libVLC still reports the song before)
+      (when-not (and (= :opening (:state old)) (#{:stopped :ended :idle} (:state snap)))
+        (swap! (:state ctl) assoc :status snap)))))
+
+(defn open!
+  "A controller with its own player and watcher. settings may give :volume,
+  :shuffle? and :repeat."
+  ([] (open! {}))
+  ([{:keys [volume shuffle? repeat] :or {volume 80 shuffle? false repeat :off}}]
+   (let [p (vlc/open-player! {:volume volume})
+         ctl (Controller :vlc p
+                         :state (atom {:queue [] :order [] :pos nil :shuffle? shuffle? :repeat repeat
+                                       :volume volume :muted? false :status {:state :idle :time-ms 0}})
+                         :watcher (atom true))]
+     (spawn-detached
+       (loop []
+         (when @(:watcher ctl)
+           (handler-case (poll! ctl)
+             (Error [c] (when @(:watcher ctl) (println "linnet: player watcher:" (condition-message c)))))
+           (sleep 100)
+           (recur))))
+     ctl)))
+
+(defn close! [ctl]
+  (reset! (:watcher ctl) false)
+  (sleep 150)
+  (vlc/close-player! (:vlc ctl)))

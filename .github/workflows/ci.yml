@@ -1,0 +1,72 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # (no window opens: the renderer runs headless)
+  SKEIN_UI_HEADLESS: "1"
+  # (CI machines have no sound card: VLC plays to nothing, at once)
+  LINNET_VLC_OPTIONS: --aout=adummy
+
+jobs:
+  test:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: macOS arm64, os: macos-15, experimental: false }
+          # skein-ui's renderer isn't proven on Linux yet, nor Skein's FFI
+          # (and so libVLC) on Windows: these jobs show what they need, and
+          # can't fail the run until they've been green a while.
+          - { name: Linux x86-64, os: ubuntu-24.04, experimental: true }
+          - { name: Linux arm64, os: ubuntu-24.04-arm, experimental: true }
+          - { name: Windows x86-64, os: windows-latest, experimental: true }
+          - { name: Windows arm64, os: windows-11-arm, experimental: true }
+    continue-on-error: ${{ matrix.experimental }}
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Files as they are in the repository
+        # (Git on Windows would give text files \r\n line ends, skein-lang's
+        # MMTk patch among them)
+        run: git config --global core.autocrlf false
+
+      - uses: actions/checkout@v5
+        with:
+          path: linnet
+
+      - uses: ./linnet/.github/actions/prepare
+
+      - name: Tests
+        working-directory: linnet
+        run: '"$SKEIN" test --serial tests'
+
+      - name: Screenshots of each view
+        if: ${{ !cancelled() }}
+        # (pictures to look at, not a test)
+        continue-on-error: true
+        working-directory: linnet
+        run: '"$SKEIN" tools/screenshots.skn "$RUNNER_TEMP/shots"'
+
+      - uses: actions/upload-artifact@v4
+        if: ${{ !cancelled() }}
+        with:
+          name: screenshots-${{ runner.os }}-${{ runner.arch }}
+          path: ${{ runner.temp }}/shots
+          if-no-files-found: ignore

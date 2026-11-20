@@ -1,0 +1,353 @@
+;;;; The music library as data: the tracks found in the music folders, with
+;;;; the listener's own names and tags laid over the files' tags. Nothing
+;;;; here writes to a music file: renaming a song, an artist, an album, a
+;;;; genre or a folder only changes what the library shows.
+;;;;
+;;;; A library is a map:
+;;;;   :roots        the music folders, in the order they were added
+;;;;   :tracks       path -> {:path :root :tags :duration-ms :art :modified :added}
+;;;;   :edits        path -> {field value}: the listener's changes to the tags
+;;;;   :folder-names folder path -> the name shown for it
+;;;;   :hidden       paths removed from the library (the files stay)
+;;;;   :playlists    [{:id :name :paths}]
+;;;;   :next-id      the next playlist's number
+
+(ns linnet.library
+  (:require [skein.io :as io]
+            [skein.string :as str]
+            [skein.sys :as sys]))
+
+(def ^:private separator (if (= :windows (sys/os)) "\\" "/"))
+
+(defn inside?
+  "Is path p folder dir or inside it? Both are absolute paths as the scan
+  found them, so this compares their text and never asks the disk."
+  [p dir]
+  (or (= p dir)
+      (str/starts-with? p (if (str/ends-with? dir separator) dir (str dir separator)))))
+
+(defn empty-library []
+  {:version 1 :roots [] :tracks {} :edits {} :folder-names {} :hidden #{} :playlists [] :next-id 1})
+
+(def fields
+  "The tags a listener can change, in the order the edit form shows them."
+  [:title :artist :album :album-artist :genre :year :track-number])
+
+(def field-labels
+  {:title "Title" :artist "Artist" :album "Album" :album-artist "Album artist" :genre "Genre"
+   :year "Year" :track-number "Track number"})
+
+(def unknown {:artist "Unknown artist" :album "Unknown album" :genre "Unknown genre"})
+
+;; ---- reading a file's tags ----
+
+(defn- leading-number
+  "The number at the start of s (\"3/12\" gives 3), or nil."
+  [s]
+  (when-let [digits (and (string? s) (re-find #"^\s*\d+" s))]
+    (parse-long (str/trim digits))))
+
+(defn tags-from-metadata
+  "The tags the library keeps, from skein.vlc's metadata of the file at path."
+  [path info]
+  (let [title (:title info)
+        ;; (libVLC names a file with no title tag by its file name)
+        title (when-not (or (str/blank? title) (= title (io/file-name path))) title)
+        year (when-let [d (:date info)] (re-find #"\d{4}" d))]
+    (into {} (remove (fn [[_ v]] (or (nil? v) (and (string? v) (str/blank? v)))))
+          {:title title :artist (:artist info) :album (:album info) :album-artist (:album-artist info)
+           :genre (:genre info) :year year :track-number (leading-number (:track-number info))
+           :disc-number (leading-number (:disc-number info))})))
+
+;; ---- tracks as shown ----
+
+(defn track
+  "The track at path as the library shows it: its file's tags with the
+  listener's edits over them, and names for whatever is missing. :edited is
+  the set of fields the listener changed. nil when the library has no such
+  track."
+  [lib path]
+  (when-let [t (get-in lib [:tracks path])]
+    (let [edits (get-in lib [:edits path] {})
+          tags (merge (:tags t) edits)]
+      (merge {:title (io/stem path)}
+             unknown
+             (into {} (remove (fn [[_ v]] (nil? v))) tags)
+             {:path path :root (:root t) :folder (io/parent path) :duration-ms (:duration-ms t)
+              :art (:art t) :added (:added t) :edited (set (keys edits))}))))
+
+(defn original
+  "The track's tags as its file has them, with the names the library uses
+  for missing ones."
+  [lib path]
+  (let [t (get-in lib [:tracks path])]
+    (merge {:title (io/stem path)} unknown (:tags t))))
+
+(defn- under-a-root? [lib path]
+  (some (fn [root] (inside? path root)) (:roots lib)))
+
+(def ^:private cache (atom {:lib nil :tracks nil}))
+
+(defn tracks
+  "Every track in the library, as shown, in no particular order."
+  [lib]
+  (let [c @cache]
+    (if (identical? lib (:lib c))
+      (:tracks c)
+      (let [ts (vec (keep (fn [path]
+                            (when-not (contains? (:hidden lib) path) (track lib path)))
+                          (keys (:tracks lib))))]
+        (reset! cache {:lib lib :tracks ts})
+        ts))))
+
+(defn- fold [s] (str/lower-case (or s "")))
+
+(defn album-artist
+  "Who an album is filed under: its album artist, else its artist."
+  [t]
+  (or (:album-artist t) (:artist t)))
+
+(defn album-key [t] [(album-artist t) (:album t)])
+
+(defn- natural-order
+  "Artist, album, disc, track number, title: the order of a shelf of CDs."
+  [t]
+  [(fold (album-artist t)) (fold (:album t)) (or (:disc-number t) 0) (or (:track-number t) 9999) (fold (:title t))])
+
+(def sort-keys
+  "The columns tracks can be sorted by."
+  #{:title :artist :album :genre :year :track-number :duration-ms :added :path})
+
+(defn sort-tracks
+  "tracks sorted by [key :asc|:desc], ties broken by natural-order. A nil
+  order gives natural-order alone."
+  [tracks [k dir]]
+  (let [base (sort-by natural-order tracks)
+        sorted (if (and k (sort-keys k))
+                 (sort-by (fn [t] (let [v (get t k)] (if (string? v) (fold v) v))) base)
+                 base)]
+    (vec (if (= dir :desc) (reverse sorted) sorted))))
+
+(defn matches?
+  "Does track t match every word of query, in its title, artist, album,
+  album artist or genre?"
+  [t query]
+  (let [words (remove str/blank? (str/split (fold query) #"\s+"))
+        text (fold (str/join " " [(:title t) (:artist t) (:album t) (:album-artist t) (:genre t)]))]
+    (every? (fn [w] (str/includes? text w)) words)))
+
+(defn search [tracks query]
+  (if (str/blank? query) tracks (vec (filter (fn [t] (matches? t query)) tracks))))
+
+;; ---- artists, albums and genres ----
+
+(defn- first-art [tracks] (some :art tracks))
+
+(defn albums
+  "The albums, sorted by name: {:key :name :artist :year :tracks :art :duration-ms}."
+  [tracks]
+  (->> (group-by album-key tracks)
+       (map (fn [[k ts]]
+              (let [ts (sort-tracks ts nil)]
+                {:key k :name (second k) :artist (first k) :tracks ts :art (first-art ts)
+                 :year (some :year ts) :duration-ms (reduce + 0 (keep :duration-ms ts))})))
+       (sort-by (fn [a] [(fold (:name a)) (fold (:artist a))]))
+       vec))
+
+(defn- groups-by [k tracks]
+  (->> (group-by k tracks)
+       (map (fn [[name ts]]
+              (let [ts (sort-tracks ts nil)]
+                {:name name :tracks ts :art (first-art ts) :albums (count (distinct (map album-key ts)))})))
+       (sort-by (fn [g] (fold (:name g))))
+       vec))
+
+(defn artists "The artists, sorted: {:name :tracks :art :albums}." [tracks] (groups-by :artist tracks))
+(defn genres "The genres, sorted: {:name :tracks :art :albums}." [tracks] (groups-by :genre tracks))
+
+;; ---- folders ----
+
+(defn folder-name
+  "The name shown for a folder: the listener's, else its own."
+  [lib folder]
+  (or (get-in lib [:folder-names folder]) (io/file-name folder) folder))
+
+(defn folder-tree
+  "The folders holding music, as nested nodes {:id path :label :count
+  :children}, one tree per music folder. :count is the number of songs in
+  the folder and the folders inside it."
+  [lib tracks]
+  (let [counts (frequencies (map :folder tracks))
+        ;; every folder between a track and its music folder
+        chain (fn [t] (loop [f (:folder t) acc []]
+                        (if (or (nil? f) (= f (:root t))) (conj acc (:root t))
+                            (recur (io/parent f) (conj acc f)))))
+        folders (set (mapcat chain tracks))
+        children (group-by io/parent (remove (set (:roots lib)) folders))
+        node (fn node [f]
+               (let [kids (mapv node (sort-by (fn [c] (fold (folder-name lib c))) (get children f)))]
+                 {:id f :label (folder-name lib f) :children kids
+                  :count (+ (get counts f 0) (reduce + 0 (map :count kids)))}))]
+    (vec (keep (fn [root] (when (contains? folders root) (node root))) (:roots lib)))))
+
+(defn folder-tracks
+  "The tracks in folder and the folders inside it, in the order the files
+  sit on disk."
+  [tracks folder]
+  (->> tracks
+       (filter (fn [t] (inside? (:path t) folder)))
+       (sort-by (fn [t] [(fold (:folder t)) (or (:disc-number t) 0) (or (:track-number t) 9999) (fold (io/file-name (:path t)))]))
+       vec))
+
+;; ---- the listener's changes ----
+
+(defn- clean-value [field v]
+  (cond (= field :track-number) (if (integer? v) v (leading-number v))
+        (string? v) (let [v (str/trim v)] (when-not (str/blank? v) v))
+        :else v))
+
+(defn edit-track
+  "Change the tags the library shows for the track at path: changes maps
+  fields to new values. A blank value, or the file's own value, drops the
+  listener's change to that field."
+  [lib path changes]
+  (if-not (get-in lib [:tracks path])
+    lib
+    (let [orig (original lib path)
+          edits (reduce-kv (fn [acc field v]
+                             (let [v (clean-value field v)]
+                               (if (or (nil? v) (= v (get orig field)))
+                                 (dissoc acc field)
+                                 (assoc acc field v))))
+                           (get-in lib [:edits path] {})
+                           (select-keys changes fields))]
+      (if (empty? edits)
+        (update lib :edits dissoc path)
+        (assoc-in lib [:edits path] edits)))))
+
+(defn restore-track
+  "Show the track at path with its file's own tags again."
+  [lib path]
+  (update lib :edits dissoc path))
+
+(defn- edit-where
+  "Set field to value on every track (as shown) that pred accepts."
+  [lib pred field value]
+  (reduce (fn [lib t] (edit-track lib (:path t) {field value}))
+          lib
+          (filter pred (tracks lib))))
+
+(defn rename-artist
+  "Show artist old as new, wherever it is a track's artist or album artist."
+  [lib old new]
+  (-> lib
+      (edit-where (fn [t] (= old (:artist t))) :artist new)
+      (edit-where (fn [t] (= old (:album-artist t))) :album-artist new)))
+
+(defn rename-album
+  "Show the album with key [artist name] as new."
+  [lib k new]
+  (edit-where lib (fn [t] (= k (album-key t))) :album new))
+
+(defn rename-genre [lib old new]
+  (edit-where lib (fn [t] (= old (:genre t))) :genre new))
+
+(defn rename-folder
+  "Show folder with name new (blank: its own name again). The folder on
+  disk keeps its name."
+  [lib folder new]
+  (let [new (when (string? new) (str/trim new))]
+    (if (or (str/blank? new) (= new (io/file-name folder)))
+      (update lib :folder-names dissoc folder)
+      (assoc-in lib [:folder-names folder] new))))
+
+;; ---- music folders and removing tracks ----
+
+(defn add-root
+  "Add a music folder, unless it, or a folder it's in, is one already."
+  [lib folder]
+  (if (some (fn [r] (inside? folder r)) (:roots lib))
+    lib
+    ;; (a folder inside the new one is now covered by it)
+    (update lib :roots (fn [rs] (conj (vec (remove (fn [r] (inside? r folder)) rs)) folder)))))
+
+(defn remove-root
+  "Stop showing a music folder and its tracks. The listener's changes to
+  them stay, for when the folder comes back."
+  [lib folder]
+  (-> lib
+      (update :roots (fn [rs] (vec (remove #{folder} rs))))
+      (update :tracks (fn [ts] (into {} (remove (fn [[p _]] (inside? p folder))) ts)))))
+
+(defn hide-tracks
+  "Remove tracks from the library (and its playlists). The files stay."
+  [lib paths]
+  (let [gone (set paths)]
+    (-> lib
+        (update :hidden into gone)
+        (update :playlists (fn [ps] (mapv (fn [p] (update p :paths (fn [xs] (vec (remove gone xs))))) ps))))))
+
+(defn put-tracks
+  "Add or replace scanned tracks ({:path …} maps), keeping their first :added."
+  [lib scanned]
+  (reduce (fn [lib t]
+            (let [old (get-in lib [:tracks (:path t)])]
+              (assoc-in lib [:tracks (:path t)] (assoc t :added (or (:added old) (:added t))))))
+          lib
+          scanned))
+
+(defn drop-missing
+  "Forget the tracks under root that aren't among paths any more."
+  [lib root paths]
+  (let [keep? (set paths)]
+    (update lib :tracks (fn [ts] (into {} (remove (fn [[p _]] (and (inside? p root) (not (keep? p))))) ts)))))
+
+;; ---- playlists ----
+
+(defn playlist [lib id] (some (fn [p] (when (= id (:id p)) p)) (:playlists lib)))
+
+(defn new-playlist
+  "Add an empty playlist named name: [lib id]."
+  [lib name]
+  (let [id (str "playlist-" (:next-id lib))]
+    [(-> lib
+         (update :next-id inc)
+         (update :playlists conj {:id id :name (if (str/blank? name) "New playlist" (str/trim name)) :paths []}))
+     id]))
+
+(defn- update-playlist [lib id f]
+  (update lib :playlists (fn [ps] (mapv (fn [p] (if (= id (:id p)) (f p) p)) ps))))
+
+(defn rename-playlist [lib id name]
+  (if (str/blank? name) lib (update-playlist lib id (fn [p] (assoc p :name (str/trim name))))))
+
+(defn delete-playlist [lib id]
+  (update lib :playlists (fn [ps] (vec (remove (fn [p] (= id (:id p))) ps)))))
+
+(defn add-to-playlist [lib id paths]
+  (update-playlist lib id (fn [p] (update p :paths into paths))))
+
+(defn remove-from-playlist
+  "Take the songs at positions indices out of playlist id."
+  [lib id indices]
+  (let [gone (set indices)]
+    (update-playlist lib id (fn [p] (update p :paths (fn [xs] (vec (keep-indexed (fn [i x] (when-not (gone i) x)) xs))))))))
+
+(defn move-in-playlist
+  "Move the song at position from to position to in playlist id."
+  [lib id from to]
+  (update-playlist lib id
+                   (fn [p]
+                     (let [xs (:paths p) n (count xs)]
+                       (if (and (< -1 from n) (< -1 to n))
+                         (let [x (nth xs from)
+                               without (vec (concat (subvec xs 0 from) (subvec xs (inc from))))]
+                           (assoc p :paths (vec (concat (subvec without 0 to) [x] (subvec without to)))))
+                         p)))))
+
+(defn playlist-tracks
+  "The tracks of playlist id in order, as shown, leaving out any no longer
+  in the library."
+  [lib id]
+  (vec (keep (fn [path] (when-not (contains? (:hidden lib) path) (track lib path)))
+             (:paths (playlist lib id)))))

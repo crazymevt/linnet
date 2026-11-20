@@ -1,0 +1,121 @@
+name: Prepare Linnet
+description: >
+  Build Skein for this runner, fetch Linnet's pinned libraries, build
+  skein-ui's renderer inside the fetched copy, and get libVLC. Linnet must
+  be checked out at linnet/. Afterwards SKEIN, SKEIN_UI_HOST and (on
+  Windows) SKEIN_VLC_LIBRARY are set for the later steps.
+
+inputs:
+  skein-lang-ref:
+    description: The skein-lang branch, tag or commit to build Skein from
+    default: main
+
+runs:
+  using: composite
+  steps:
+    - name: Where things go
+      shell: bash
+      run: |
+        exe=""; [ "$RUNNER_OS" = Windows ] && exe=".exe"
+        {
+          echo "EXE=$exe"
+          echo "SKEIN=$GITHUB_WORKSPACE/skein-lang/target/release/skein$exe"
+          # (git packages are fetched here: a known place, to build the renderer in)
+          echo "SKEIN_DEPS=$RUNNER_TEMP/skein-deps"
+          echo "LINNET_DATA_DIR=$RUNNER_TEMP/linnet-data"
+        } >> "$GITHUB_ENV"
+        # skein-ui's commit, as Linnet's skein.lock pins it
+        sha=$(grep -o 'skein-ui {:git "[^"]*", :sha "[0-9a-f]*"' linnet/skein.lock | grep -o '[0-9a-f]\{40\}')
+        [ -n "$sha" ] || { echo "::error::No skein-ui commit in skein.lock"; exit 1; }
+        echo "SKEIN_UI_DIR=$RUNNER_TEMP/skein-deps/skein-ui/$sha" >> "$GITHUB_ENV"
+
+    - uses: actions/checkout@v5
+      with:
+        repository: crazymevt/skein-lang
+        ref: ${{ inputs.skein-lang-ref }}
+        path: skein-lang
+
+    - name: Linux packages
+      if: runner.os == 'Linux'
+      shell: bash
+      # GTK and xdo for the renderer's menus, a software Vulkan driver for
+      # headless screenshots, and libVLC with its plugins
+      run: |
+        sudo apt-get update -qq
+        sudo apt-get install -y -qq libgtk-3-dev libxdo-dev mesa-vulkan-drivers libvlc5 vlc-plugin-base
+
+    - name: VLC (macOS)
+      if: runner.os == 'macOS'
+      shell: bash
+      run: brew install --cask vlc
+
+    - uses: dtolnay/rust-toolchain@stable
+
+    - uses: Swatinem/rust-cache@v2
+      with:
+        prefix-key: skein
+        workspaces: skein-lang
+
+    - name: clang on the PATH (Windows)
+      if: runner.os == 'Windows'
+      shell: bash
+      # (as skein-lang's CI: its C dependencies build with clang on Windows)
+      run: |
+        if [ -x "/c/Program Files/LLVM/bin/clang.exe" ]; then
+          echo "C:\Program Files\LLVM\bin" >> "$GITHUB_PATH"
+        fi
+
+    - name: Build Skein (Windows)
+      if: runner.os == 'Windows'
+      shell: bash
+      working-directory: skein-lang
+      # (MMTk with its Windows layer, in place of the one on crates.io; not
+      # --locked, since Cargo.lock names the one on crates.io)
+      run: |
+        tools/windows/mmtk.sh
+        cargo --config=patch.crates-io.mmtk.path='target/mmtk-windows' build --release -p skein
+
+    - name: Build Skein
+      if: runner.os != 'Windows'
+      shell: bash
+      working-directory: skein-lang
+      run: cargo build --release --locked -p skein
+
+    - name: Fetch Linnet's libraries
+      shell: bash
+      working-directory: linnet
+      run: |
+        "$SKEIN" deps
+        test -f "$SKEIN_UI_DIR/Cargo.toml" || { echo "::error::skein-ui isn't at $SKEIN_UI_DIR"; exit 1; }
+
+    - uses: Swatinem/rust-cache@v2
+      with:
+        prefix-key: renderer
+        workspaces: ${{ env.SKEIN_UI_DIR }}
+
+    - name: Build skein-ui's renderer
+      shell: bash
+      # (inside the fetched copy, so skein package finds it there too)
+      run: |
+        cd "$SKEIN_UI_DIR"
+        cargo build --release --locked -p skein-ui-host
+        echo "SKEIN_UI_HOST=$SKEIN_UI_DIR/target/release/skein-ui-host$EXE" >> "$GITHUB_ENV"
+
+    - name: Cached VLC download (Windows)
+      if: runner.os == 'Windows'
+      id: vlc-cache
+      uses: actions/cache@v4
+      with:
+        path: ${{ env.LINNET_DATA_DIR }}/vlc
+        key: vlc-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('linnet/src/linnet/setup.skn') }}
+
+    - name: VLC, as Linnet's setup downloads it (Windows)
+      if: runner.os == 'Windows' && steps.vlc-cache.outputs.cache-hit != 'true'
+      shell: bash
+      working-directory: linnet
+      run: '"$SKEIN" tools/install-vlc.skn'
+
+    - name: VLC from the cache (Windows)
+      if: runner.os == 'Windows' && steps.vlc-cache.outputs.cache-hit == 'true'
+      shell: bash
+      run: echo "SKEIN_VLC_LIBRARY=$LINNET_DATA_DIR/vlc/libvlc.dll" >> "$GITHUB_ENV"

@@ -1,0 +1,43 @@
+;;;; Render Linnet's icons from assets/linnet.svg (and linnet-small.svg for
+;;;; the smallest sizes): the PNGs, and assets/linnet.ico for Windows.
+;;;; Needs rsvg-convert (librsvg). Run from the project folder:
+;;;;   ../skein-lang/target/release/skein tools/make-icons.skn
+
+(require '[skein.bytes :as b] '[skein.io :as io] '[skein.process :as process])
+
+(def small-sizes
+  "Sizes drawn from the simplified picture: title bars, the tray and small
+  lists (16), at 125% and 150% display scaling (20, 24), and the taskbar (32)."
+  #{16 20 24 32})
+
+(def ico-sizes [16 20 24 32 40 48 64 128 256])
+
+(defn render
+  "The icon at size pixels, as PNG bytes."
+  [size]
+  (let [svg (if (small-sizes size) "assets/linnet-small.svg" "assets/linnet.svg")
+        out (io/temp-file "linnet-icon" ".png")
+        r (process/sh "rsvg-convert" "-w" (str size) "-h" (str size) svg "-o" out)]
+    (when-not (zero? (:exit r)) (error (str "rsvg-convert failed: " (:err r))))
+    (let [png (io/read-bytes out)] (io/delete! out) png)))
+
+(defn ico
+  "An ICO file holding each [size png] image. Each entry is a PNG, which
+  Windows reads from Vista on. A size of 256 is written as 0."
+  [images]
+  (let [u8 (fn [n] (b/uint-bytes n 1 :le))
+        u16 (fn [n] (b/uint-bytes n 2 :le))
+        u32 (fn [n] (b/uint-bytes n 4 :le))
+        header (b/concat-bytes (u16 0) (u16 1) (u16 (count images)))
+        first-offset (+ 6 (* 16 (count images)))
+        offsets (reductions + first-offset (map (comp count second) images))
+        entries (map (fn [[size png] offset]
+                       (b/concat-bytes (u8 (if (= 256 size) 0 size)) (u8 (if (= 256 size) 0 size))
+                                       (u8 0) (u8 0) (u16 1) (u16 32) (u32 (count png)) (u32 offset)))
+                     images offsets)]
+    (apply b/concat-bytes header (concat entries (map second images)))))
+
+(doseq [size [1024 256 64]]
+  (io/write-bytes (str "assets/linnet-" size ".png") (render size)))
+(io/write-bytes "assets/linnet.ico" (ico (mapv (fn [s] [s (render s)]) ico-sizes)))
+(println "wrote assets/linnet-1024.png, -256.png, -64.png and assets/linnet.ico" (str "(" (count ico-sizes) " sizes)"))

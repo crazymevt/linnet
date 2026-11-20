@@ -1,0 +1,224 @@
+;;;; Getting libVLC when it isn't installed. On Windows (x64 or ARM64) the
+;;;; player offers to download VideoLAN's own VLC zip for its architecture,
+;;;; checks it against the SHA-256 VideoLAN publishes, and unpacks only what
+;;;; playing needs (libvlc.dll, libvlccore.dll and the plugins) into its data
+;;;; folder. Elsewhere it asks for VLC to be installed.
+;;;;
+;;;; The DLLs must match this process, not Windows: an x64 Skein running
+;;;; under emulation on an ARM PC loads x64 DLLs. skein.sys/arch is the
+;;;; process's architecture, so that is what picks the build.
+
+(ns linnet.setup
+  (:require [skein.bytes :as b]
+            [skein.crypto :as crypto]
+            [skein.http :as http]
+            [skein.io :as io]
+            [skein.string :as str]
+            [skein.sys :as sys]
+            [skein.ui :as ui]
+            [skein.vlc :as vlc]
+            [skein.zip :as zip]
+            [linnet.store :as store]
+            [linnet.theme :as theme]
+            [linnet.widgets :as w]))
+
+(def vlc-releases
+  "The VLC builds to download, by the architecture of this process:
+  VideoLAN's Windows zips, each with the SHA-256 from the .sha256 file
+  beside it on download.videolan.org."
+  {:x86_64 {:version "3.0.24"
+            :url "https://download.videolan.org/pub/videolan/vlc/3.0.24/win64/vlc-3.0.24-win64.zip"
+            :sha256 "fcf30850371ad10c9373cc4f0f4501e7dee49e3e9ae9f20c72fb2661a1ca6323"
+            :size 82765861}
+   :aarch64 {:version "3.0.24"
+             :url "https://download.videolan.org/pub/videolan/vlc/3.0.24/winarm64/vlc-3.0.24-winarm64.zip"
+             :sha256 "f096226211f67f8e06e50cd0d6a948d842db128ff22a676dc1ca1cc6114baba5"
+             :size 76738526}})
+
+(defn release-for
+  "The VLC build for a process on os and arch, or nil when there's none to
+  download (macOS and Linux install VLC their own way)."
+  [os arch]
+  (when (= :windows os) (get vlc-releases arch)))
+
+(defn vlc-release
+  "The VLC build for this process, or nil."
+  []
+  (release-for (sys/os) (sys/arch)))
+
+(defn vlc-dir [] (io/path (store/data-dir) "vlc"))
+
+(def ^:private library-name
+  (case (sys/os) :windows "libvlc.dll" :macos "libvlc.dylib" "libvlc.so.5"))
+
+(defn downloaded-library
+  "The libVLC this app downloaded, or nil."
+  []
+  (let [p (io/path (vlc-dir) library-name)]
+    (when (io/file? p) p)))
+
+(defn ready?
+  "Can the player play? Uses the downloaded VLC if there is one, else an
+  installed VLC."
+  []
+  (when-let [p (downloaded-library)]
+    (try (vlc/use-library! p) (catch Error _ nil)))
+  (vlc/available?))
+
+(defn can-download?
+  "Is there a VLC build to download for this process?"
+  []
+  (some? (vlc-release)))
+
+;; ---- downloading ----
+
+(defn- download!
+  "Fetch url to path, a megabyte at a time: (on-progress done total)."
+  [url path expected-size on-progress]
+  (io/mkdirs! (io/parent path))
+  (http/with-response [resp {:url url :timeout 60000}]
+    (when-not (= 200 (:status resp))
+      (error (str "The download server answered " (:status resp) " " (:reason resp))))
+    (let [total (or (some-> (get (:headers resp) "content-length") parse-long) expected-size)]
+      (loop [chunks [] done 0]
+        (on-progress done total)
+        (if-let [chunk (io/read (:body resp) 1048576)]
+          (recur (conj chunks chunk) (+ done (count chunk)))
+          (let [tmp (str path ".part")]
+            (io/write-bytes tmp (apply b/concat-bytes chunks))
+            (io/rename! tmp path)))))))
+
+(defn- sha256-of [bs] (crypto/hex (crypto/sha256 bs)))
+
+(def ^:private skipped-plugins
+  "Plugin folders a music player doesn't use: VLC's own window and video."
+  ["plugins/gui/" "plugins/video_output/" "plugins/video_filter/" "plugins/video_splitter/"
+   "plugins/visualization/" "plugins/plugins.dat"])
+
+(defn- vlc-folder
+  "The folder in the zip that holds libvlc.dll (\"vlc-3.0.24\" in
+  VideoLAN's zips), or nil if none does."
+  [entries]
+  (some (fn [e] (when-let [[_ f] (re-matches #"(?:(.*)/)?libvlc\.dll" (:name e))] (or f ""))) entries))
+
+(defn- wanted
+  "The path an entry of the VLC zip goes to under the vlc folder, or nil
+  when the player doesn't need it."
+  [folder name]
+  (let [prefix (if (= "" folder) "" (str folder "/"))]
+    (when (str/starts-with? name prefix)
+      (let [rest (subs name (count prefix))]
+        (when (and (not (str/ends-with? rest "/"))
+                   (or (#{"libvlc.dll" "libvlccore.dll"} rest)
+                       (and (str/starts-with? rest "plugins/")
+                            (not-any? (fn [p] (str/starts-with? rest p)) skipped-plugins))))
+          rest)))))
+
+(defn- unpack!
+  "Unpack the zip bs's libVLC into dir, through a folder beside it, so a
+  half-unpacked copy is never used. (on-progress done total)."
+  [bs dir on-progress]
+  (let [all (zip/entries bs)
+        folder (or (vlc-folder all) (error "The download doesn't hold VLC's libraries"))
+        entries (vec (keep (fn [e] (when-let [rel (wanted folder (:name e))] [e rel])) all))
+        tmp (str dir ".new")]
+    (when-not (some (fn [[_ rel]] (= "libvlccore.dll" rel)) entries)
+      (error "The download doesn't hold VLC's libraries"))
+    (when (io/exists? tmp) (io/delete! tmp :recursive true))
+    (doseq [[i [e rel]] (map-indexed vector entries)]
+      (when (zero? (mod i 25)) (on-progress i (count entries)))
+      (let [target (apply io/path tmp (str/split rel #"/"))]
+        (io/mkdirs! (io/parent target))
+        (io/write-bytes target (zip/read-entry bs e :max-size (* 512 1024 1024)))))
+    (on-progress (count entries) (count entries))
+    (when (io/exists? dir) (io/delete! dir :recursive true))
+    (io/rename! tmp dir)
+    dir))
+
+(defn install!
+  "Download release (this process's vlc-release by default), check it and unpack it.
+  (on-progress {:stage :downloading|:checking|:unpacking :done :total}).
+  The path of the installed libvlc."
+  ([on-progress] (install! (vlc-release) on-progress))
+  ([release on-progress]
+   (let [zip-path (io/path (store/data-dir) "downloads" (io/file-name (:url release)))
+         ok? (fn [] (and (io/file? zip-path) (= (:sha256 release) (sha256-of (io/read-bytes zip-path)))))]
+     (when-not (ok?)
+       (download! (:url release) zip-path (:size release)
+                  (fn [done total] (on-progress {:stage :downloading :done done :total total}))))
+     (on-progress {:stage :checking :done 0 :total 1})
+     (let [bs (io/read-bytes zip-path)]
+       (when-not (= (:sha256 release) (sha256-of bs))
+         (io/delete! zip-path)
+         (error "The download was damaged on the way. Please try again."))
+       (unpack! bs (vlc-dir)
+                (fn [done total] (on-progress {:stage :unpacking :done done :total total}))))
+     (io/delete! zip-path)
+     (io/path (vlc-dir) "libvlc.dll"))))
+
+;; ---- the setup window ----
+
+(def ^:private setup-state (atom {:stage :ask :progress nil :error nil}))
+
+(defn- progress-text [{:keys [stage done total]}]
+  (case stage
+    :downloading (str "Downloading… " (quot (or done 0) 1048576) " of " (quot (or total 0) 1048576) " MB")
+    :checking "Checking the download…"
+    :unpacking "Setting up…"
+    ""))
+
+(defn- setup-view [{:keys [stage progress error]} {:keys [on-download on-retry on-quit]}]
+  [:box {:flex-grow 1 :background :bg :align-items :center :justify-content :center :padding 30}
+   [:column {:class :dialog :width 500 :gap 14 :align-items :center}
+    (theme/logo 88)
+    [:text {:font-size 22 :font-weight :bold} "One more thing before the music"]
+    (if (can-download?)
+      [:text {:class :muted :font-size 15 :text-align :center :wrap true}
+       "Linnet plays songs with VLC, a free player from VideoLAN. It isn't on this computer yet. "
+       "Linnet can fetch it for you from videolan.org (about " (quot (+ (:size (vlc-release)) 500000) 1000000)
+       " MB, once) and keep it in its own folder."]
+      [:text {:class :muted :font-size 15 :text-align :center :wrap true}
+       "Linnet plays songs with VLC, a free player from VideoLAN. Please install VLC from videolan.org, then click Try again."])
+    (when (#{:downloading :checking :unpacking} stage)
+      [:column {:gap 6 :width 420 :padding [6 0]}
+       [:box {:height 8 :border-radius 4 :background :line}
+        [:box {:height 8 :border-radius 4 :background :accent
+               :width [:% (if (and progress (pos? (or (:total progress) 0)))
+                            (* 100.0 (/ (:done progress) (:total progress))) 0)]}]]
+       [:text {:class :muted :font-size 13 :text-align :center} (progress-text progress)]])
+    (when error
+      [:text {:color :danger :font-size 14 :text-align :center :wrap true} error])
+    [:row {:gap 8 :padding [8 0 0 0]}
+     (w/button {:id :quit :label "Quit" :kind :secondary :on-click on-quit})
+     (cond
+       (#{:downloading :checking :unpacking} stage) nil
+       (can-download?) (w/button {:id :download :label (if error "Try again" "Download VLC") :icon :plus :on-click on-download})
+       :else (w/button {:id :retry :label "Try again" :icon :refresh :on-click on-retry}))]]])
+
+(defn show!
+  "Open the setup window. When the player can play, (on-ready) opens the
+  player, and the setup window closes."
+  ([on-ready] (show! (vlc-release) on-ready))
+  ([release on-ready]
+   (let [wid (atom nil)
+         finish! (fn [] (on-ready) (ui/close-window @wid))
+         handlers {:on-quit (fn [] (ui/close-window @wid))
+                   :on-retry (fn []
+                               (if (ready?)
+                                 (finish!)
+                                 (swap! setup-state assoc :error "VLC still isn't found. Install it from videolan.org, then try again.")))
+                   :on-download (fn []
+                                  (swap! setup-state assoc :stage :downloading :error nil
+                                         :progress {:stage :downloading :done 0 :total (:size release)})
+                                  (spawn-detached
+                                    (handler-case
+                                      (let [p (install! release (fn [pr] (swap! setup-state assoc :stage (:stage pr) :progress pr)))]
+                                        (vlc/use-library! p)
+                                        (if (vlc/available?)
+                                          (finish!)
+                                          (swap! setup-state assoc :stage :ask :error "VLC was downloaded but won't start. Please try again.")))
+                                      (Error [c] (swap! setup-state assoc :stage :ask
+                                                        :error (str "That didn't work: " (condition-message c)))))))}]
+     (reset! wid (ui/window {:title "Linnet — setting up" :icon (theme/asset "linnet.ico") :size [640 520] :resizable false}
+                            (fn [s] (setup-view s handlers)) setup-state))
+     @wid)))

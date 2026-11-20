@@ -1,0 +1,26 @@
+;;;; Starting Linnet: set up VLC if it's missing, then open the
+;;;; player, and save everything when its window closes.
+
+(ns linnet.main
+  (:require [skein.sys :as sys]
+            [skein.ui :as ui]
+            [linnet.app :as app]
+            [linnet.setup :as setup]
+            [linnet.theme :as theme]))
+
+(def usage "usage: linnet [--help]
+
+Opens Linnet, the music player. Its library lives in the app's data folder
+(Application Support/Linnet on macOS, %APPDATA%\\Linnet on Windows). Set LINNET_DATA_DIR to keep it somewhere else.")
+
+(defn main [& args]
+  (case (vec args)
+    ["--help"] (println usage)
+    [] (do (ui/theme! theme/theme)
+           (if (setup/ready?)
+             (app/start!)
+             (setup/show! (fn [] (app/start!))))
+           (ui/wait-closed)
+           (app/stop!)
+           (sys/exit 0))
+    (do (println usage) (sys/exit 2))))

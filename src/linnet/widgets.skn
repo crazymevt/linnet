@@ -1,0 +1,188 @@
+;;;; The player's building blocks: the seek and volume bars, album covers,
+;;;; the song table and the tile grid.
+
+(ns linnet.widgets
+  (:require [skein.io :as io]
+            [skein.string :as str]
+            [skein.ui :as ui]
+            [linnet.theme :as theme]))
+
+(defn clock
+  "ms as m:ss, or h:mm:ss for an hour or more; \"\" when unknown."
+  [ms]
+  (if (and ms (not (neg? ms)))
+    (let [s (quot ms 1000) h (quot s 3600) m (quot (rem s 3600) 60) sec (rem s 60)]
+      (if (pos? h) (format "%d:%02d:%02d" h m sec) (format "%d:%02d" m sec)))
+    ""))
+
+(defn total-time
+  "A friendly length for a list of songs: \"42 min\" or \"1 hr 5 min\"."
+  [ms]
+  (let [m (quot (+ (or ms 0) 30000) 60000)]
+    (if (>= m 60) (str (quot m 60) " hr " (rem m 60) " min") (str m " min"))))
+
+(defn songs-label [n] (str n (if (= 1 n) " song" " songs")))
+
+;; ---- bars you click and drag ----
+
+(defn- fraction [x width] (max 0.0 (min 1.0 (/ (double x) (max 1 width)))))
+
+(defclass Bar (ui/Widget)
+  ((value :initform 0.0) (width :initform 300) (on-change :initform nil)
+   (track :initform :bar-line) (fill :initform :bar-text) (knob :initform :bar-text)))
+
+(defmethod ui/measure ((b Bar)) [(:width b) 18])
+
+(defmethod ui/paint ((b Bar) size)
+  (let [[w h] size
+        v (max 0.0 (min 1.0 (double (:value b))))
+        y (- (/ h 2) 2)
+        x (* w v)]
+    [[:rounded-rect [0 y w 4] 2 {:fill (:track b)}]
+     [:rounded-rect [0 y (max 4 x) 4] 2 {:fill (:fill b)}]
+     [:circle [(max 6 (min (- w 6) x)) (/ h 2)] 6 {:fill (:knob b)}]]))
+
+(defmethod ui/widget-events ((b Bar)) #{:click :drag})
+
+(defmethod ui/on-event ((b Bar) e)
+  (when-let [f (:on-change b)]
+    (f (fraction (if (= :drag (:event e)) (:local-x e) (:x e)) (:width b)))))
+
+(defn bar
+  "A horizontal bar showing value (0..1); clicking or dragging calls
+  (on-change fraction)."
+  [{:keys [value width on-change]}]
+  (Bar :value (or value 0.0) :width width :on-change on-change))
+
+;; ---- covers ----
+
+(defn cover
+  "An album's cover picture at size, or a coloured square with a note when
+  it has none."
+  [{:keys [art name size radius] :or {radius 8}}]
+  (if (and art (io/file? art))
+    [:box {:width size :height size :border-radius radius :overflow :hidden :flex-shrink 0 :background :line}
+     [:image {:src art :width size :height size :fit :cover}]]
+    [:box {:width size :height size :border-radius radius :flex-shrink 0 :background (theme/cover-colour name)
+           :align-items :center :justify-content :center}
+     (theme/icon :note (max 14 (quot size 3)) "#ffffffcc")]))
+
+;; ---- the song table ----
+
+(def row-height 34)
+
+(defn- sizing
+  "A column's share of the row: the title column takes what's spare, and
+  every column gives way (down to a minimum) in a narrow window, so the
+  header and the rows always line up and never push the window wider."
+  [col]
+  (if (:grow col)
+    {:flex-grow 2 :flex-shrink 1 :flex-basis (:width col) :min-width 120}
+    {:flex-grow 0 :flex-shrink 1 :flex-basis (:width col) :min-width (min 56 (:width col))}))
+
+(defn- header-cell [col sort on-sort]
+  [:row (merge {:key (:key col) :class :header-cell :align-items :center :height 32 :overflow :hidden
+                :on-click (fn [_] (when on-sort (on-sort (:key col))))}
+               (sizing col))
+   [:text {:font-size 12 :font-weight :bold :color :muted :white-space :nowrap}
+    (str/upper-case (:title col))
+    (when (= (:key col) (first sort)) (if (= :desc (second sort)) "  ▼" "  ▲"))]])
+
+(defn- cell [col content]
+  [:row (merge {:key (:key col) :align-items :center :padding [0 10] :overflow :hidden}
+               (sizing col))
+   content])
+
+(defn track-table
+  "The song table: only the rows in view exist. Options:
+   :id, :rows (tracks), :columns [{:key :title :width :grow? :render (fn [track])}],
+   :sort and :on-sort (nil :on-sort: the headers don't sort), :selected
+   (a row index) and :on-select, :on-play (called with a row index, on a
+   double click or Enter), :menu (fn [i] context menu items) and
+   :on-command (fn [i command]), :current (the path playing), :scroll-y
+   and :on-scroll, :viewport (pixels of rows to draw)."
+  [{:keys [id rows columns sort on-sort selected on-select on-play menu on-command current
+           scroll-y on-scroll viewport] :or {scroll-y 0 viewport 900}}]
+  (let [n (count rows)
+        top (max 0 (dec (quot (int scroll-y) row-height)))
+        end (min n (+ top (quot viewport row-height) 4))
+        select! (fn [i] (when (and on-select (< -1 i n)) (on-select i)))]
+    [:column {:id id :flex-grow 1 :flex-shrink 1 :min-height 0 :min-width 0 :overflow :hidden :focusable true
+              :on-key (fn [e]
+                        (let [k (:key e) i (or selected -1)]
+                          (cond (= k :arrow-down) (select! (min (dec n) (inc i)))
+                                (= k :arrow-up) (select! (max 0 (dec i)))
+                                (= k :home) (select! 0)
+                                (= k :end) (select! (dec n))
+                                (and (= k :enter) (>= i 0) on-play) (on-play i)
+                                :else nil)))}
+     [:row {:class :table-header :flex-shrink 0 :padding [0 8] :min-width 0 :overflow :hidden}
+      (for [c columns] (header-cell c sort on-sort))]
+     [:box {:height 1 :background :line :flex-shrink 0}]
+     [:scroll {:flex-grow 1 :min-height 0 :scroll-y scroll-y
+               :on-scroll (fn [e] (when (and on-scroll (not= (:y e) scroll-y)) (on-scroll (:y e))))}
+      [:box {:height (* n row-height) :flex-shrink 0}
+       (for [i (range top end)]
+         (let [t (nth rows i)
+               playing? (and current (= current (:path t)))]
+           [:row (cond-> {:key i :id (keyword (str (name id) "-row-" i)) :class :track-row :selected (= i selected)
+                          :position :absolute :inset [(* i row-height) 0 :auto 0] :height row-height :padding [0 8] :overflow :hidden
+                          :background (when (and (odd? i) (not= i selected)) :row-alt)
+                          :on-click (fn [e] (if (and (= 2 (:count e)) on-play) (on-play i) (select! i)))}
+                   menu (assoc :context-menu (menu i)
+                               :on-command (fn [e] (when on-command (on-command i (:command e))))))
+            (for [c columns]
+              (cell c (let [v ((:render c) t)]
+                        (cond (string? v) [:text {:white-space :nowrap :color (when (and playing? (= :title (:key c))) :playing)
+                                                  :font-weight (when playing? :bold) :font-size 14}
+                                           v]
+                              (nil? v) [:text ""]
+                              :else v))))]))]]]))
+
+(defn column
+  "A table column showing (f track), or the track's value for k."
+  ([k title width] (column k title width nil))
+  ([k title width opts]
+   (merge {:key k :title title :width width :render (fn [t] (let [v (get t k)] (if (nil? v) "" (str v))))} opts)))
+
+(def standard-columns
+  [(column :track-number "#" 52)
+   (column :title "Title" 220 {:grow true})
+   (column :artist "Artist" 180)
+   (column :album "Album" 200)
+   (column :duration-ms "Length" 80 {:render (fn [t] (clock (:duration-ms t)))})
+   (column :genre "Genre" 130)
+   (column :year "Year" 70)])
+
+;; ---- tiles ----
+
+(defn tile
+  "A cover and two lines, for an album, artist or genre."
+  [{:keys [key id art name title subtitle on-open menu on-command]}]
+  [:column (cond-> {:key key :id id :class :tile :width 176 :gap 6 :overflow :hidden
+                    :on-click (fn [_] (on-open))}
+             menu (assoc :context-menu menu :on-command on-command))
+   (cover {:art art :name (or name title) :size 160 :radius 10})
+   [:text {:font-weight :bold :font-size 14 :white-space :nowrap :width 160} title]
+   [:text {:class :muted :font-size 13 :white-space :nowrap :width 160} subtitle]])
+
+(defn tiles [children]
+  [:scroll {:flex-grow 1 :min-height 0}
+   [:box {:flex-direction :row :flex-wrap :wrap :gap 10 :padding [16 20]}
+    children]])
+
+(defn icon-button
+  "A small round button with an icon, and a tooltip."
+  [{:keys [id icon tooltip on-click size color] :or {size 18 color :text}}]
+  [:box {:id id :class :icon-button :tooltip tooltip :on-click (fn [_] (on-click))}
+   (theme/icon icon size color)])
+
+(defn button
+  "A text button: :kind :primary (the default), :secondary or :danger."
+  [{:keys [id label on-click kind icon] :or {kind :primary}}]
+  [:button {:id id :class kind :on-click (fn [_] (on-click))}
+   (if icon
+     [:row {:gap 6 :align-items :center}
+      (theme/icon icon 16 (if (= kind :secondary) :text :on-accent))
+      [:text {:font-size 14 :color (if (= kind :secondary) :text :on-accent)} label]]
+     [:text {:font-size 14 :color (if (= kind :secondary) :text :on-accent)} label])])

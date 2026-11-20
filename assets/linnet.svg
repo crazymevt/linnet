@@ -1,0 +1,63 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <title>Linnet</title>
+  <!-- A male linnet in spring colours (grey head, crimson forehead and
+       breast, chestnut back, dark wings with white flashes, a forked tail),
+       singing on a branch. -->
+  <defs>
+    <linearGradient id="sky" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#4f8fe8"/>
+      <stop offset="1" stop-color="#1b4f9e"/>
+    </linearGradient>
+    <clipPath id="body-clip">
+      <ellipse cx="520" cy="590" rx="215" ry="150" transform="rotate(-30 520 590)"/>
+    </clipPath>
+  </defs>
+
+  <rect x="0" y="0" width="1024" height="1024" rx="224" fill="url(#sky)"/>
+
+  <!-- the music note he's singing -->
+  <g fill="#ffffff">
+    <ellipse cx="822" cy="300" rx="40" ry="30" transform="rotate(-20 822 300)"/>
+    <rect x="849" y="150" width="15" height="152" rx="7.5"/>
+    <path d="M856 150 C 898 166, 924 192, 918 240 C 910 210, 888 194, 856 190 Z"/>
+  </g>
+
+  <!-- the branch -->
+  <path d="M130 820 C 320 772, 560 758, 900 780" stroke="#6b4228" stroke-width="36" fill="none" stroke-linecap="round"/>
+  <path d="M770 772 C 812 728, 864 720, 894 732 C 864 756, 824 770, 770 772 Z" fill="#83b56c"/>
+  <path d="M300 800 C 270 760, 230 745, 200 750 C 222 780, 258 796, 300 800 Z" fill="#83b56c"/>
+
+  <!-- the tail: dark and forked -->
+  <path d="M370 680 L 250 850 L 300 830 L 300 890 L 420 720 Z" fill="#3a2921"/>
+
+  <!-- the feet on the branch -->
+  <g stroke="#4a3a33" stroke-width="13" stroke-linecap="round" fill="none">
+    <path d="M500 720 L 488 772"/>
+    <path d="M560 712 L 566 770"/>
+  </g>
+
+  <!-- the body: chestnut back, pale belly, crimson breast -->
+  <ellipse cx="520" cy="590" rx="215" ry="150" transform="rotate(-30 520 590)" fill="#9c5b34"/>
+  <g clip-path="url(#body-clip)">
+    <ellipse cx="590" cy="700" rx="200" ry="120" transform="rotate(-30 590 700)" fill="#f2e6d6"/>
+    <ellipse cx="660" cy="560" rx="100" ry="105" fill="#d8394b"/>
+  </g>
+
+  <!-- the wing: dark, pointed toward the tail, with white flashes -->
+  <path d="M600 480 C 540 470, 440 520, 360 690 C 470 650, 570 590, 610 520 Z" fill="#45302a"/>
+  <path d="M585 492 C 530 498, 470 540, 430 600" stroke="#a8653a" stroke-width="24" fill="none" stroke-linecap="round"/>
+  <g stroke="#ffffff" stroke-width="10" stroke-linecap="round" fill="none">
+    <path d="M420 640 L 470 600"/>
+    <path d="M400 662 L 440 630"/>
+  </g>
+
+  <!-- the head: grey, with a crimson forehead -->
+  <circle cx="680" cy="420" r="108" fill="#8e939b"/>
+  <path d="M700 318 C 742 316, 778 336, 790 372 C 760 360, 730 356, 706 364 Z" fill="#d8394b"/>
+
+  <!-- the beak, open in song, and the eye -->
+  <path d="M780 400 L 842 388 L 784 418 Z" fill="#5c6067"/>
+  <path d="M784 424 L 836 440 L 780 442 Z" fill="#4c5056"/>
+  <circle cx="728" cy="404" r="17" fill="#1b1b1f"/>
+  <circle cx="733" cy="398" r="5.5" fill="#ffffff"/>
+</svg>

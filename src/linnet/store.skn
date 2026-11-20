@@ -1,0 +1,69 @@
+;;;; Where the library lives on disk: one EDN file and a folder of cover
+;;;; art in the app's data folder (Application Support on macOS, %APPDATA%
+;;;; on Windows). LINNET_DATA_DIR overrides it, for tests and trying things.
+
+(ns linnet.store
+  (:require [skein.edn :as edn]
+            [skein.io :as io]
+            [skein.sys :as sys]
+            [linnet.library :as library]))
+
+(def app-name "Linnet")
+
+(def ^:private data-root (atom nil))
+
+(defn set-data-dir!
+  "Keep the library under dir instead of the usual place (tests do)."
+  [dir]
+  (reset! data-root dir))
+
+(defn data-dir []
+  (or @data-root
+      (not-empty (sys/getenv "LINNET_DATA_DIR"))
+      (io/path (case (sys/os)
+                 :macos (io/path (sys/home-dir) "Library" "Application Support")
+                 :windows (or (not-empty (sys/getenv "APPDATA")) (io/path (sys/home-dir) "AppData" "Roaming"))
+                 (or (not-empty (sys/getenv "XDG_CONFIG_HOME")) (io/path (sys/home-dir) ".config")))
+               app-name)))
+
+(defn library-file [] (io/path (data-dir) "library.edn"))
+(defn art-dir [] (io/path (data-dir) "art"))
+(defn settings-file [] (io/path (data-dir) "settings.edn"))
+
+(defn- read-edn [file]
+  (when (io/file? file)
+    (try (edn/read-string (io/read-text file))
+         (catch Error e
+           ;; (keep the unreadable file for a person to look at, and start afresh)
+           (io/rename! file (str file ".broken"))
+           (io/eprintln "linnet: could not read" file ":" (condition-message e))
+           nil))))
+
+(defn load-library
+  "The saved library, or an empty one."
+  []
+  (merge (library/empty-library) (read-edn (library-file))))
+
+(defn load-settings [] (or (read-edn (settings-file)) {}))
+
+(defn- write-edn! [file data]
+  (io/mkdirs! (io/parent file))
+  (io/write-atomic! file (pr-str data)))
+
+(defn save-library! [lib] (write-edn! (library-file) lib))
+(defn save-settings! [settings] (write-edn! (settings-file) settings))
+
+(defn autosave!
+  "Save the value of atom a with save! shortly after each change settles,
+  so a burst of changes writes the file once."
+  [a save!]
+  (let [pending (atom false)]
+    (add-watch a ::autosave
+               (fn [_ _ old new]
+                 (when (and (not (identical? old new)) (compare-and-set! pending false true))
+                   (spawn-detached
+                     (sleep 500)
+                     (reset! pending false)
+                     (handler-case (save! @a)
+                       (Error [c] (io/eprintln "linnet: could not save:" (condition-message c))))))))
+    a))

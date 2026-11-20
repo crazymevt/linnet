@@ -1,0 +1,162 @@
+(ns library-test
+  (:require [support]
+            [skein.io :as io]
+            [skein.test :refer [deftest is testing]]
+            [linnet.library :as lib]
+            [linnet.scan :as scan]
+            [linnet.store :as store]))
+
+(def tmp (io/path (io/temp-directory) (str "linnet-test-" (nano-time))))
+(store/set-data-dir! (io/path tmp "data"))
+
+(def root (io/canonical "tests/fixtures/music"))
+(defn- at [& parts] (apply io/path root parts))
+
+(def scanned
+  "The fixture library, scanned once."
+  (delay (let [a (atom (lib/empty-library))
+               progress (atom [])]
+           (scan/add-folder! a root (fn [p] (swap! progress conj p)))
+           {:lib @a :progress @progress})))
+
+(defn- by-title [l title] (some (fn [t] (when (= title (:title t)) t)) (lib/tracks l)))
+
+(deftest scanning-a-folder
+  (let [{l :lib progress :progress} @scanned
+        ts (lib/tracks l)]
+    (is (= [root] (:roots l)))
+    (is (= 10 (count ts)) "audio files only: no notes, no ._ copies")
+    (is (= {:root root :done 10 :total 10} (last progress)))
+    (let [t (by-title l "Morning Light")]
+      (is (= "Marigold Strings" (:artist t)))
+      (is (= "Dawn Suite" (:album t)))
+      (is (= "Classical" (:genre t)))
+      (is (= "1998" (:year t)))
+      (is (= 1 (:track-number t)))
+      ;; (libVLC estimates an MP3's length from its bitrate when reading tags;
+      ;; playing it gives the true length, which the app keeps then)
+      (is (pos? (:duration-ms t)))
+      (is (io/file? (:art t)) "cover art copied out of the file")
+      (is (io/under? (:art t) (store/art-dir))))
+    (let [t (by-title l "Grandpa's Tune")]
+      (is (some? t) "an untagged file is named by its file name")
+      (is (= "Unknown artist" (:artist t)))
+      (is (= "Unknown album" (:album t)))
+      (is (nil? (:art t))))))
+
+(deftest rescanning
+  (let [a (atom (:lib @scanned))]
+    (is (= 0 (scan/scan! a root (fn [_]))) "nothing changed, nothing read")
+    (swap! a lib/put-tracks [{:path (at "Gone.mp3") :root root :tags {} :added 0}])
+    (scan/scan! a root (fn [_]))
+    (is (nil? (get-in @a [:tracks (at "Gone.mp3")])) "a file that's gone is forgotten")))
+
+(deftest grouping
+  (let [ts (lib/tracks (:lib @scanned))]
+    (is (= ["Dawn Suite" "Front Porch" "Garden Waltzes" "Hymns We Love" "Unknown album"]
+           (mapv :name (lib/albums ts))))
+    (is (= ["Morning Light" "River Song" "Evening Hymn"]
+           (mapv :title (:tracks (first (lib/albums ts))))) "in track order")
+    (is (= ["Clara Wynn" "Hearthside Band" "Marigold Strings" "The Evening Choir" "Unknown artist"]
+           (mapv :name (lib/artists ts))))
+    (is (= ["Classical" "Country" "Gospel" "Unknown genre"] (mapv :name (lib/genres ts))))
+    (is (= 5 (count (:tracks (first (lib/genres ts))))))
+    (is (= ["Evening Hymn"] (mapv :title (lib/search ts "marigold HYMN"))) "every word, any case")
+    (is (= 3 (count (lib/search ts "dawn"))))
+    (is (= ["Sweet Tea" "Sunday Morning" "Rose Waltz"] (take 3 (mapv :title (lib/sort-tracks ts [:title :desc])))))))
+
+(deftest folders
+  (let [l (:lib @scanned)
+        ts (lib/tracks l)
+        [tree] (lib/folder-tree l ts)]
+    (is (= root (:id tree)))
+    (is (= "music" (:label tree)))
+    (is (= 10 (:count tree)))
+    (is (= ["Classical" "Country" "Favourites"] (mapv :label (:children tree))))
+    (let [classical (first (:children tree))]
+      (is (= 5 (:count classical)))
+      (is (= ["Marigold Strings - Dawn Suite" "Piano"] (mapv :label (:children classical)))))
+    (is (= ["Morning Light" "River Song" "Evening Hymn" "Rose Waltz" "Ivy Waltz"]
+           (mapv :title (lib/folder-tracks ts (at "Classical")))) "as the files sit on disk")
+    (testing "a folder's own name"
+      (let [l2 (lib/rename-folder l (at "Favourites") "Mom's Favourites")
+            [tree] (lib/folder-tree l2 (lib/tracks l2))]
+        (is (= "Mom's Favourites" (:label (nth (:children tree) 2))))
+        (is (io/directory? (at "Favourites")) "the folder on disk keeps its name")
+        (is (= l (update (lib/rename-folder l2 (at "Favourites") "") :folder-names (fnil identity {})))
+            "a blank name restores the folder's own")))))
+
+(deftest edits-leave-files-alone
+  (let [l (:lib @scanned)
+        path (:path (by-title l "River Song"))
+        before (io/read-bytes path)
+        l2 (lib/edit-track l path {:title "The River" :artist " Marigold  " :track-number "7"})
+        t (lib/track l2 path)]
+    (is (= "The River" (:title t)))
+    (is (= 7 (:track-number t)))
+    (is (= #{:title :track-number :artist} (:edited t)))
+    (is (= "River Song" (:title (lib/original l2 path))))
+    (is (= before (io/read-bytes path)) "the file is unchanged")
+    (is (= #{:track-number :artist}
+           (:edited (lib/track (lib/edit-track l2 path {:title "River Song"}) path))) "the file's own value drops the edit")
+    (is (= "River Song" (:title (lib/track (lib/restore-track l2 path) path))))
+    (testing "renaming everywhere"
+      (let [l3 (lib/rename-artist l "Marigold Strings" "The Marigolds")]
+        (is (= 3 (count (filter #(= "The Marigolds" (:artist %)) (lib/tracks l3)))))
+        (is (not-any? #(= "Marigold Strings" (:artist %)) (lib/tracks l3))))
+      (let [l4 (lib/rename-album l ["Hearthside Band" "Front Porch"] "Porch Songs")]
+        (is (= ["Front Porch" "Long Road Home" "Sweet Tea"]
+               (mapv :title (:tracks (some #(when (= "Porch Songs" (:name %)) %) (lib/albums (lib/tracks l4))))))))
+      (let [l5 (lib/rename-genre l "Gospel" "Sunday")]
+        (is (= "Sunday" (:genre (by-title l5 "Sunday Morning"))))))))
+
+(deftest playlists-and-hiding
+  (let [l (:lib @scanned)
+        paths (mapv :path (lib/sort-tracks (lib/tracks l) [:title :asc]))
+        [l id] (lib/new-playlist l "Car trip")
+        l (lib/add-to-playlist l id (take 3 paths))
+        titles (fn [l] (mapv :title (lib/playlist-tracks l id)))]
+    (is (= ["Evening Hymn" "Front Porch" "Grandpa's Tune"] (titles l)))
+    (is (= ["Front Porch" "Grandpa's Tune" "Evening Hymn"] (titles (lib/move-in-playlist l id 0 2))))
+    (is (= ["Evening Hymn" "Grandpa's Tune"] (titles (lib/remove-from-playlist l id [1]))))
+    (is (= "Road trip" (:name (lib/playlist (lib/rename-playlist l id "Road trip") id))))
+    (is (= "Car trip" (:name (lib/playlist (lib/rename-playlist l id "  ") id))) "not to a blank name")
+    (let [l2 (lib/hide-tracks l [(first paths)])]
+      (is (= 9 (count (lib/tracks l2))))
+      (is (= ["Front Porch" "Grandpa's Tune"] (titles l2)) "out of playlists too")
+      (is (io/file? (first paths)) "the file stays"))
+    (is (empty? (:playlists (lib/delete-playlist l id))))))
+
+(deftest saving
+  (let [l (:lib @scanned)]
+    (store/save-library! l)
+    (is (= l (store/load-library)))
+    (io/write-text (store/library-file) "{:broken")
+    (is (= (lib/empty-library) (store/load-library)) "an unreadable file starts afresh")
+    (is (io/file? (str (store/library-file) ".broken")) "and is kept")))
+
+(deftest a-cover-changed-in-the-file
+  ;; VLC keeps covers in a cache filed by artist and album, and would give
+  ;; back the old one: a changed file's cover must be read again.
+  (let [folder (io/path tmp "changing")
+        song (io/path folder "song.mp3")
+        fixtures "tests/fixtures/changed-cover"
+        a (atom (lib/empty-library))]
+    (io/mkdirs! folder)
+    ;; (written, not copied, so the file is newer than anything VLC cached)
+    (io/write-bytes song (io/read-bytes (io/path fixtures "before.mp3")))
+    (scan/add-folder! a folder (fn [_]))
+    (let [path (:path (first (lib/tracks @a)))
+          before (io/read-bytes (:art (lib/track @a path)))]
+      (sleep 20)
+      (io/write-bytes song (io/read-bytes (io/path fixtures "after.mp3")))
+      (is (= 1 (scan/scan! a (io/canonical folder) (fn [_]))) "the changed file is read again")
+      (let [art (:art (lib/track @a path))]
+        (is (io/file? art))
+        (is (not= before (io/read-bytes art)) "with its new cover"))))
+  (testing "only VLC's own cache is ever cleared"
+    (let [cached? #'scan/in-vlc-cache?]
+      (is (cached? "/Users/mom/Library/Caches/org.videolan.vlc/art/artistalbum/A/B/art.png"))
+      (is (cached? "C:\\Users\\mom\\AppData\\Roaming\\vlc\\art\\artistalbum\\A\\B\\art.jpg"))
+      (is (not (cached? "C:\\Users\\mom\\Music\\Hymns\\cover.jpg")))
+      (is (not (cached? "/Users/mom/Music/art/cover.jpg")) "a music folder named art"))))
