@@ -38,11 +38,12 @@ runs:
     - name: Linux packages
       if: runner.os == 'Linux'
       shell: bash
-      # GTK and xdo for the renderer's menus, a software Vulkan driver for
-      # headless screenshots, and libVLC with its plugins
+      # GTK for the renderer's menus (and no more: skein-ui's renderer needs
+      # nothing a desktop hasn't got), a software Vulkan driver for headless
+      # screenshots, and libVLC with its plugins
       run: |
         sudo apt-get update -qq
-        sudo apt-get install -y -qq libgtk-3-dev libxdo-dev mesa-vulkan-drivers libvlc5 vlc-plugin-base
+        sudo apt-get install -y -qq libgtk-3-dev mesa-vulkan-drivers libvlc5 vlc-plugin-base
 
     # macOS: VideoLAN's own disk image, pinned and checked like the Windows
     # zips in src/linnet/setup.skn, and cached, so VideoLAN's servers are

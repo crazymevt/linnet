@@ -1,12 +1,12 @@
 {:name linnet
- :version "0.1.1"
+ :version "0.1.2"
  :paths ["src"]
  ;; Each is pinned to a commit on its main branch. `skein deps` fetches them
  ;; and writes skein.lock; after changing a pin, run `skein deps --update`.
  ;; The renderer isn't in skein-ui's repository: run.sh and the Makefile
  ;; point SKEIN_UI_HOST at a built one (see the README).
  :deps {skein-ui {:git "https://github.com/crazymevt/skein-ui.git"
-                  :sha "565559fe4859ac87b141b013777b614d14569f8f"}
+                  :sha "a96a750bc591004c6629c6374a48ea978ad91096"}
         skein-vlc {:git "https://github.com/crazymevt/skein-vlc.git"
                    :sha "6e6e32b5107227ff60f43bd999d9cd4545d75c3d"}}
  :main linnet.main/main

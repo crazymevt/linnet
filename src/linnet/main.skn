@@ -9,7 +9,7 @@
             [linnet.setup :as setup]
             [linnet.theme :as theme]))
 
-(def version "0.1.1")
+(def version "0.1.2")
 
 (def usage "usage: linnet [--help]
 
