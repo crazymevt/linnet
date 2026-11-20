@@ -1,25 +1,31 @@
 name: Prepare Linnet
 description: >
-  Build Skein for this runner, fetch Linnet's pinned libraries, build
+  Install Skein for this runner (the release Set up Skein pins below, or
+  built from skein-lang-ref), fetch Linnet's pinned libraries, build
   skein-ui's renderer inside the fetched copy, and get libVLC. Linnet must
   be checked out at linnet/. Afterwards SKEIN, SKEIN_UI_HOST and (on
   Windows) SKEIN_VLC_LIBRARY are set for the later steps.
 
 inputs:
   skein-lang-ref:
-    description: The skein-lang branch, tag or commit to build Skein from
-    default: main
+    description: >
+      A skein-lang branch, tag or commit to build Skein from, in place of
+      the release (for a Skein that isn't released yet)
+    default: ""
 
 runs:
   using: composite
   steps:
     - name: Where things go
       shell: bash
+      env:
+        SKEIN_LANG_REF: ${{ inputs.skein-lang-ref }}
       run: |
         exe=""; [ "$RUNNER_OS" = Windows ] && exe=".exe"
         {
           echo "EXE=$exe"
-          echo "SKEIN=$GITHUB_WORKSPACE/skein-lang/target/release/skein$exe"
+          # (Set up Skein sets it for a release)
+          [ -z "$SKEIN_LANG_REF" ] || echo "SKEIN=$GITHUB_WORKSPACE/skein-lang/target/release/skein$exe"
           # (git packages are fetched here: a known place, to build the renderer in)
           echo "SKEIN_DEPS=$RUNNER_TEMP/skein-deps"
           echo "LINNET_DATA_DIR=$RUNNER_TEMP/linnet-data"
@@ -29,7 +35,14 @@ runs:
         [ -n "$sha" ] || { echo "::error::No skein-ui commit in skein.lock"; exit 1; }
         echo "SKEIN_UI_DIR=$RUNNER_TEMP/skein-deps/skein-ui/$sha" >> "$GITHUB_ENV"
 
+    # Skein as released: the version is this action's ref. (Change it here
+    # for a new Skein.)
+    - name: Set up Skein
+      if: inputs.skein-lang-ref == ''
+      uses: crazymevt/skein-lang@v0.1.0
+
     - uses: actions/checkout@v5
+      if: inputs.skein-lang-ref != ''
       with:
         repository: crazymevt/skein-lang
         ref: ${{ inputs.skein-lang-ref }}
@@ -77,6 +90,7 @@ runs:
     - uses: dtolnay/rust-toolchain@stable
 
     - uses: Swatinem/rust-cache@v2
+      if: inputs.skein-lang-ref != ''
       with:
         prefix-key: skein
         workspaces: skein-lang
@@ -84,14 +98,15 @@ runs:
     - name: clang on the PATH (Windows)
       if: runner.os == 'Windows'
       shell: bash
-      # (as skein-lang's CI: its C dependencies build with clang on Windows)
+      # (as skein-lang's CI: its C dependencies, and the renderer's, build
+      # with clang on Windows)
       run: |
         if [ -x "/c/Program Files/LLVM/bin/clang.exe" ]; then
           echo "C:\Program Files\LLVM\bin" >> "$GITHUB_PATH"
         fi
 
     - name: Build Skein (Windows)
-      if: runner.os == 'Windows'
+      if: runner.os == 'Windows' && inputs.skein-lang-ref != ''
       shell: bash
       working-directory: skein-lang
       # (MMTk with its Windows layer, in place of the one on crates.io; not
@@ -103,7 +118,7 @@ runs:
         cargo --config "patch.crates-io.mmtk.path='target/mmtk-windows'" build --release -p skein
 
     - name: Build Skein
-      if: runner.os != 'Windows'
+      if: runner.os != 'Windows' && inputs.skein-lang-ref != ''
       shell: bash
       working-directory: skein-lang
       run: cargo build --release --locked -p skein

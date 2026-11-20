@@ -93,7 +93,7 @@ Linnet keeps a log, `linnet.log`, in the same data folder: when it started and w
 
 GitHub Actions builds and tests Linnet on macOS (arm64), Linux (x86-64 and arm64) and Windows (x86-64 and arm64). `.github/actions/prepare` does the setup both workflows share:
 
-- **Skein:** built from skein-lang's `main`. On Windows it uses clang and skein-lang's MMTk patch, as skein-lang's own CI does.
+- **Skein:** a [skein-lang release](https://github.com/crazymevt/skein-lang/releases), pinned in the setup action (`crazymevt/skein-lang@v0.1.0`, Set up Skein). For a Skein that isn't released yet, give the setup action a `skein-lang-ref` and it builds that instead, on Windows with clang and skein-lang's MMTk patch, as skein-lang's own CI does.
 - **Libraries:** `skein deps` fetches the pinned skein-ui and skein-vlc, and the renderer is built inside the fetched skein-ui.
 - **libVLC:** from apt on Linux. On macOS it's VideoLAN's own disk image, pinned by version and SHA-256 in the setup action. On Windows it's downloaded with `tools/install-vlc.skn`, the same code as Linnet's setup window, so CI also checks VideoLAN's real zips. On macOS and Windows the unpacked VLC is cached, so VideoLAN's servers are asked only when a pin changes. (Keep the macOS pin in step with `vlc-releases` in `src/linnet/setup.skn`.)
 
