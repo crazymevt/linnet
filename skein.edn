@@ -14,6 +14,8 @@
            :display-name "Linnet"
            :icon "assets/linnet-1024.png"
            :resources ["assets"]
+           ;; (leave out what main can't reach: the image goes from 8.7 MB to 3.0)
+           :shake true
            :targets [:app :cli]
            ;; skein package --windows --launcher …/skein.exe (on Windows, by
            ;; default the skein running): windowed, as a skein-ui app is
