@@ -35,11 +35,13 @@ runs:
         [ -n "$sha" ] || { echo "::error::No skein-ui commit in skein.lock"; exit 1; }
         echo "SKEIN_UI_DIR=$RUNNER_TEMP/skein-deps/skein-ui/$sha" >> "$GITHUB_ENV"
 
-    # Skein as released: the version is this action's ref. (Change it here
-    # for a new Skein.)
+    # Skein as released. (Change both for a new Skein: Set up Skein 0.1.0
+    # can't tell its own ref inside a composite action such as this one.)
     - name: Set up Skein
       if: inputs.skein-lang-ref == ''
       uses: crazymevt/skein-lang@v0.1.0
+      with:
+        version: 0.1.0
 
     - uses: actions/checkout@v5
       if: inputs.skein-lang-ref != ''
