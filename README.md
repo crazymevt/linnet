@@ -49,7 +49,7 @@ A VLC that Linnet downloaded wins over an installed one. To move to a newer VLC,
 
 ## Running it
 
-It needs a Skein release at `../skein-lang/target/release/skein`. Its libraries, [skein-ui](https://github.com/crazymevt/skein-ui) and [skein-vlc](https://github.com/crazymevt/skein-vlc), come from GitHub, pinned to commits in `skein.edn` and `skein.lock`. `skein deps` fetches them, and `skein deps --update` looks them up again after you change a pin. skein-ui is pinned to [crazymevt/skein-ui#3](https://github.com/crazymevt/skein-ui/pull/3), which adds window icons, until that's merged.
+It needs a Skein release at `../skein-lang/target/release/skein`. Its libraries, [skein-ui](https://github.com/crazymevt/skein-ui) and [skein-vlc](https://github.com/crazymevt/skein-vlc), come from GitHub, pinned to commits in `skein.edn` and `skein.lock`. `skein deps` fetches them, and `skein deps --update` looks them up again after you change a pin.
 
 skein-ui's renderer is a compiled program that isn't in its repository, so a fetched copy has none. `run.sh` and the Makefile use `SKEIN_UI_HOST` if it's set, and otherwise the renderer built in a skein-ui checkout beside this project (`../skein-libs/skein-ui/target/release/skein-ui-host`). To build one in a fresh checkout:
 
