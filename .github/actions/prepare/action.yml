@@ -71,9 +71,11 @@ runs:
       working-directory: skein-lang
       # (MMTk with its Windows layer, in place of the one on crates.io; not
       # --locked, since Cargo.lock names the one on crates.io)
+      # The value is TOML, so the path keeps its quotes: inside the double
+      # quotes, the shell leaves them for cargo.
       run: |
         tools/windows/mmtk.sh
-        cargo --config=patch.crates-io.mmtk.path='target/mmtk-windows' build --release -p skein
+        cargo --config "patch.crates-io.mmtk.path='target/mmtk-windows'" build --release -p skein
 
     - name: Build Skein
       if: runner.os != 'Windows'
